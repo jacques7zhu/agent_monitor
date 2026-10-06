@@ -4,6 +4,8 @@ A terminal dashboard for live **Claude Code** and **Codex** sessions. For each s
 
 It's a single Python file that uses only the standard library (Python 3.8+).
 
+![agentmon in the terminal](docs/terminal.png)
+
 ```sh
 python3 agentmon.py              # interactive TUI
 python3 agentmon.py once         # print the table once
@@ -24,6 +26,13 @@ python3 agentmon_tray.py                     # run it now (a second launch opens
 python3 agentmon_tray.py uninstall-desktop
 ```
 
+<p>
+  <img src="docs/topbar.png" alt="agentmon in the Ubuntu top bar" height="56"><br>
+  <img src="docs/menu.png" alt="agentmon indicator menu" width="480">
+</p>
+
+![agentmon details window](docs/details.png)
+
 Use the TUI's `install-hooks` as well, so "waiting for approval" is detected exactly rather than guessed.
 
 ## Where the data comes from
@@ -31,11 +40,13 @@ Use the TUI's `install-hooks` as well, so "waiting for approval" is detected exa
 | | Live sessions | Status | Usage |
 |---|---|---|---|
 | Claude Code | `~/.claude/sessions/<pid>.json` (pid must be alive) | `status` busy/idle in the same file | `message.usage` in `~/.claude/projects/*/<session>.jsonl`, deduplicated per request |
-| Codex | rollout files held open by a `codex` process or written in the last 10 minutes | `task_started` / `task_complete` | latest `token_count` event, including `rate_limits` |
+| Codex | threads a running `codex` process holds in `~/.codex/thread-writer-locks/` (guardian sub-agents hidden), mapped to `~/.codex/sessions/**/rollout-*.jsonl` | `task_started` / `task_complete` | latest `token_count` event, including `rate_limits` |
 
 Session files alone can't show whether an agent is waiting for approval. Without hooks, agentmon shows `waiting?` when a tool call has no result and the transcript hasn't changed for 5 seconds. A long-running command looks the same, so this is only a guess.
 
 `install-hooks` adds `agentmon.py hook --agent …` entries to `~/.claude/settings.json` and `~/.codex/hooks.json`. Existing hooks are kept, the original files are backed up to `*.agentmon.bak`, and running it again is safe. Each hook appends one line to `~/.local/state/agentmon/events.jsonl`. `PermissionRequest`, or a `Notification` of type `permission_prompt`, turns the row red as **waiting**. Already-running sessions pick up the hooks only after a restart.
+
+*The screenshots use made-up demo sessions.*
 
 ## Tests
 

@@ -177,7 +177,7 @@ class DetailsWindow(Gtk.Window):
         self.sessions = {}
         self.wanted_key = None
 
-        # columns: visible text..., status color, key (agent\0id)
+        # columns: visible text..., status color, key (agent/id)
         self.store = Gtk.ListStore(*([str] * len(self.COLS)), str, str)
         self.view = Gtk.TreeView(model=self.store)
         for i, title in enumerate(self.COLS):
@@ -231,12 +231,12 @@ class DetailsWindow(Gtk.Window):
 
     def update(self, sessions, now, codex_limits):
         sel = self.selected()
-        keep = self.wanted_key or (("%s\0%s" % session_key(sel)) if sel else None)
-        self.sessions = {"%s\0%s" % session_key(s): s for s in sessions}
+        keep = self.wanted_key or (("%s/%s" % session_key(sel)) if sel else None)
+        self.sessions = {"%s/%s" % session_key(s): s for s in sessions}
         rows = []
         for s in sorted(sessions, key=am.SORTS[0][1]):
             vals = [str(get(s, now)) for _, _, get in am.COLUMNS]
-            rows.append(vals + [COLORS.get(s.status, "#888888"), "%s\0%s" % session_key(s)])
+            rows.append(vals + [COLORS.get(s.status, "#888888"), "%s/%s" % session_key(s)])
         # Update in place so the selection and scroll position survive refreshes.
         if len(self.store) != len(rows) or any(
                 self.store[i][len(self.COLS) + 1] != r[-1] for i, r in enumerate(rows)):
@@ -259,7 +259,7 @@ class DetailsWindow(Gtk.Window):
         self.show_detail()
 
     def select(self, key):
-        self.wanted_key = "%s\0%s" % key
+        self.wanted_key = "%s/%s" % key
 
     def show_detail(self):
         s = self.selected()

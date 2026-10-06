@@ -205,6 +205,18 @@ class AttentionTest(unittest.TestCase):
         att.update([self.sess(am.IDLE)], 1001 + tray.FLASH_FINISHED + 1)
         self.assertFalse(att.blinking())
 
+    @unittest.skipUnless(os.environ.get("DISPLAY"), "needs a display")
+    def test_details_window_selects_requested_session(self):
+        w = tray.DetailsWindow(None)
+        rows = [am.Session(agent="claude", id="a", name="one", tmux="%1"),
+                am.Session(agent="codex", id="b", name="two")]
+        w.select(("codex", "b"))
+        w.update(rows, 0, None)
+        self.assertEqual(w.selected().name, "two")
+        w.update(rows, 0, None)  # selection survives a refresh
+        self.assertEqual(w.selected().name, "two")
+        w.destroy()
+
     def test_dismiss_silences_current_wait(self):
         att = tray.Attention()
         att.update([self.sess(am.PROCESSING)], 0)
