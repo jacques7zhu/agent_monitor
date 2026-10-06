@@ -13,6 +13,19 @@ python3 agentmon.py uninstall-hooks
 
 Keys: `↑/↓` or `j/k` select · `Enter` details (last prompt and reply) · `s` cycle sort · `a` show or hide exited sessions · `b` bell on approval requests · `q` quit.
 
+## Ubuntu top-bar indicator
+
+`agentmon_tray.py` puts a dot in the top-right panel with a short label such as `1 waiting 2 busy`. The dot is red when an agent is waiting for approval, amber when one is working, green when all are idle, and grey when no sessions are running. It blinks while a session waits for approval, and for 20 seconds after a session finishes a turn. A desktop notification has **Show details** and **Go to pane** buttons. Click the indicator for a menu with one entry per session; clicking an entry opens a details window with the table, the last prompt and reply, and a *Go to tmux pane* button.
+
+```sh
+sudo apt install gir1.2-appindicator3-0.1    # one-time; Ubuntu ships the GNOME AppIndicator extension
+python3 agentmon_tray.py install-desktop     # adds "agentmon" to the app menu and starts it on login
+python3 agentmon_tray.py                     # run it now (a second launch opens the details window)
+python3 agentmon_tray.py uninstall-desktop
+```
+
+Use the TUI's `install-hooks` as well, so "waiting for approval" is detected exactly rather than guessed.
+
 ## Where the data comes from
 
 | | Live sessions | Status | Usage |

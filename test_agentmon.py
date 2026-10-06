@@ -93,6 +93,37 @@ class CodexRolloutTest(TmpDirTest):
         self.assertEqual(ro.last_message, "done")
 
 
+class CodexSubagentTest(TmpDirTest):
+    def test_guardian_thread_is_subagent(self):
+        path = os.path.join(self.tmp, "rollout-g.jsonl")
+        write_jsonl(path, [{"type": "session_meta", "payload": {
+            "id": "g", "source": {"subagent": {"other": "guardian"}}, "thread_source": "guardian_review"}}])
+        ro = am.CodexRollout(path)
+        ro.refresh()
+        self.assertTrue(ro.subagent)
+
+
+class MonitorSessionSwapTest(unittest.TestCase):
+    def test_new_session_id_in_same_process_is_not_an_exit(self):
+        class Fake:
+            rate_limits = None
+
+            def __init__(self):
+                self.rows = []
+
+            def sessions(self, hooks, now):
+                return list(self.rows)
+
+        claude, codex = Fake(), Fake()
+        mon = am.Monitor(claude=claude, codex=codex, hooks=am.HookEvents(os.devnull))
+        codex.rows = [am.Session(agent="codex", id="placeholder", pid=42)]
+        mon.refresh(1)
+        codex.rows = [am.Session(agent="codex", id="real", pid=42)]
+        self.assertEqual([s.id for s in mon.refresh(2)], ["real"])
+        codex.rows = []
+        self.assertEqual([(s.id, s.status) for s in mon.refresh(3)], [("real", am.EXITED)])
+
+
 class ResolveStatusTest(unittest.TestCase):
     def test_no_hooks_uses_file_state(self):
         self.assertEqual(am.resolve_status(None, am.PROCESSING, 10), (am.PROCESSING, 10))
@@ -141,6 +172,46 @@ class HookEventsTest(TmpDirTest):
         he = am.HookEvents(path)
         he.refresh()
         self.assertEqual(he.get("claude", "s")["event"], "PermissionRequest")
+
+
+try:
+    import agentmon_tray as tray
+except (ImportError, ValueError):  # no GTK on this machine
+    tray = None
+
+
+@unittest.skipIf(tray is None, "GTK not available")
+class AttentionTest(unittest.TestCase):
+    def sess(self, status):
+        return am.Session(agent="claude", id="s", status=status)
+
+    def test_blink_rules(self):
+        att = tray.Attention()
+        self.assertEqual(att.update([self.sess(am.PROCESSING)], 0), [])  # first sight: quiet
+        self.assertFalse(att.blinking())
+
+        events = att.update([self.sess(am.WAITING)], 1)
+        self.assertEqual([k for k, _ in events], ["waiting"])
+        self.assertTrue(att.blinking())
+        att.update([self.sess(am.WAITING)], 999)  # keeps blinking while waiting
+        self.assertTrue(att.blinking())
+
+        att.update([self.sess(am.PROCESSING)], 1000)  # approved -> stop
+        self.assertFalse(att.blinking())
+
+        events = att.update([self.sess(am.IDLE)], 1001)
+        self.assertEqual([k for k, _ in events], ["finished"])
+        self.assertTrue(att.blinking())
+        att.update([self.sess(am.IDLE)], 1001 + tray.FLASH_FINISHED + 1)
+        self.assertFalse(att.blinking())
+
+    def test_dismiss_silences_current_wait(self):
+        att = tray.Attention()
+        att.update([self.sess(am.PROCESSING)], 0)
+        att.update([self.sess(am.WAITING)], 1)
+        att.dismiss()
+        att.update([self.sess(am.WAITING)], 2)
+        self.assertFalse(att.blinking())
 
 
 if __name__ == "__main__":

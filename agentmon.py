@@ -296,6 +296,7 @@ class CodexRollout:
         self.last_prompt = ""
         self.last_message = ""
         self.mtime = 0.0
+        self.subagent = False  # e.g. the guardian thread that reviews approvals
 
     def refresh(self):
         try:
@@ -309,6 +310,8 @@ class CodexRollout:
             if t == "session_meta":
                 self.id = p.get("id") or p.get("session_id") or self.id
                 self.cwd = p.get("cwd", self.cwd)
+                self.subagent = ("subagent" in json.dumps(p.get("source"))
+                                 or p.get("thread_source") not in (None, "user"))
             elif t == "turn_context":
                 self.model = p.get("model") or self.model
                 self.cwd = p.get("cwd") or self.cwd
@@ -360,18 +363,38 @@ def codex_pids() -> List[int]:
     return pids
 
 
-def open_rollouts(pids) -> Dict[str, int]:
-    """Rollout files currently held open by a codex process -> that pid."""
-    found = {}
-    for pid in pids:
-        for fd in glob.glob("/proc/%d/fd/*" % pid):
-            try:
-                target = os.readlink(fd)
-            except OSError:
-                continue
-            if "/rollout-" in target and target.endswith(".jsonl"):
-                found[target] = pid
-    return found
+def held_files(pid):
+    """Thread ids (from thread-writer-locks) and rollout files a codex process holds open."""
+    threads, rollouts = set(), set()
+    for fd in glob.glob("/proc/%d/fd/*" % pid):
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if "/thread-writer-locks/" in target and target.endswith(".lock"):
+            threads.add(os.path.basename(target)[: -len(".lock")])
+        elif "/rollout-" in target and target.endswith(".jsonl"):
+            rollouts.add(target)
+    return threads, rollouts
+
+
+def proc_tmux_pane(pid):
+    """The tmux pane id (e.g. '%9') a process runs in, from its environment."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            for var in f.read().split(b"\0"):
+                if var.startswith(b"TMUX_PANE="):
+                    return var.split(b"=", 1)[1].decode()
+    except OSError:
+        pass
+    return ""
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        return ""
 
 
 class CodexSource:
@@ -382,6 +405,19 @@ class CodexSource:
         self.rollouts: Dict[str, CodexRollout] = {}
         self.rate_limits = None
         self._paths_by_id: Dict[str, str] = {}
+
+    def default_model(self):
+        try:
+            with open(os.path.join(self.base, "config.toml")) as f:
+                for line in f:
+                    if line.startswith("["):
+                        break
+                    key, _, val = line.partition("=")
+                    if key.strip() == "model":
+                        return val.strip().strip('"')
+        except OSError:
+            pass
+        return ""
 
     def recent_rollouts(self, now):
         paths = []
@@ -396,52 +432,74 @@ class CodexSource:
         return paths
 
     def path_for_id(self, sid):
+        # Only cache hits: a new thread gets its rollout file on the first prompt.
         if sid not in self._paths_by_id:
             hits = glob.glob(os.path.join(self.base, "sessions", "*", "*", "*", "rollout-*%s.jsonl" % sid))
-            self._paths_by_id[sid] = hits[0] if hits else ""
+            if not hits:
+                return ""
+            self._paths_by_id[sid] = hits[0]
         return self._paths_by_id[sid]
 
     def sessions(self, hooks: HookEvents, now: float) -> List[Session]:
         pids = codex_pids()
         if not pids:
             return []
-        held = open_rollouts(pids)
-        candidates = set(held) | set(self.recent_rollouts(now))
-        # Sessions the hooks know about and that haven't ended stay live even when quiet.
-        for (agent, sid), ev in hooks.latest.items():
-            if agent == self.agent and sid and ev.get("event") != "SessionEnd":
-                p = self.path_for_id(sid)
-                if p:
-                    candidates.add(p)
         out = []
-        for path in candidates:
-            ro = self.rollouts.get(path)
-            if ro is None:
-                ro = self.rollouts[path] = CodexRollout(path)
-            ro.refresh()
-            if not ro.id:
-                continue
-            if ro.rate_limits:
-                self.rate_limits = ro.rate_limits
-            tot = ro.total
-            cached = tot.get("cached_input_tokens", 0)
-            s = Session(
-                agent=self.agent, id=ro.id, name=os.path.basename(ro.cwd.rstrip("/")) or ro.id[:8],
-                cwd=ro.cwd, pid=held.get(path), model=ro.model,
-                tokens_in=tot.get("input_tokens", 0) - cached, tokens_cached=cached,
-                tokens_out=tot.get("output_tokens", 0),
-                ctx_used=ro.ctx_used, ctx_window=ro.ctx_window, last_activity=ro.mtime,
-                last_prompt=ro.last_prompt, last_message=ro.last_message,
-            )
-            file_state = PROCESSING if ro.busy else IDLE
-            if ro.busy and ro.pending_calls and now - ro.mtime > GUESS_STALL:
-                file_state = WAITING_GUESS
-            s.status, s.status_since = resolve_status(
-                hooks.get(self.agent, ro.id), file_state, ro.state_ts or ro.mtime)
-            if s.status == EXITED:
-                continue
-            out.append(s)
-        return out
+        any_threads = False
+        for pid in pids:
+            threads, paths = held_files(pid)
+            any_threads = any_threads or bool(threads)
+            paths |= {p for p in map(self.path_for_id, threads) if p}
+            rows = [s for s in (self.from_rollout(p, pid, hooks, now) for p in sorted(paths)) if s]
+            if not rows and threads:
+                rows = [self.placeholder(pid, threads, hooks)]
+            pane = proc_tmux_pane(pid)
+            for s in rows:
+                s.tmux = pane
+            out += rows
+        if not any_threads:
+            # Older Codex without thread-writer locks: fall back to recently written rollouts.
+            for p in self.recent_rollouts(now):
+                s = self.from_rollout(p, None, hooks, now)
+                if s and all(s.id != o.id for o in out):
+                    out.append(s)
+        return [s for s in out if s.status != EXITED]
+
+    def placeholder(self, pid, threads, hooks):
+        """A session that has no rollout yet (Codex writes it on the first prompt)."""
+        with_events = [t for t in threads if hooks.get(self.agent, t)]
+        tid = (with_events or sorted(threads))[0]
+        cwd = proc_cwd(pid)
+        s = Session(agent=self.agent, id=tid, name=os.path.basename(cwd.rstrip("/")) or tid[:8],
+                    cwd=cwd, pid=pid, model=self.default_model(), last_prompt="(no prompt yet)")
+        s.status, s.status_since = resolve_status(hooks.get(self.agent, tid), IDLE, 0)
+        return s
+
+    def from_rollout(self, path, pid, hooks, now) -> Optional[Session]:
+        ro = self.rollouts.get(path)
+        if ro is None:
+            ro = self.rollouts[path] = CodexRollout(path)
+        ro.refresh()
+        if not ro.id or ro.subagent:
+            return None
+        if ro.rate_limits:
+            self.rate_limits = ro.rate_limits
+        tot = ro.total
+        cached = tot.get("cached_input_tokens", 0)
+        s = Session(
+            agent=self.agent, id=ro.id, name=os.path.basename(ro.cwd.rstrip("/")) or ro.id[:8],
+            cwd=ro.cwd, pid=pid, model=ro.model or self.default_model(),
+            tokens_in=tot.get("input_tokens", 0) - cached, tokens_cached=cached,
+            tokens_out=tot.get("output_tokens", 0),
+            ctx_used=ro.ctx_used, ctx_window=ro.ctx_window, last_activity=ro.mtime,
+            last_prompt=ro.last_prompt, last_message=ro.last_message,
+        )
+        file_state = PROCESSING if ro.busy else IDLE
+        if ro.busy and ro.pending_calls and now - ro.mtime > GUESS_STALL:
+            file_state = WAITING_GUESS
+        s.status, s.status_since = resolve_status(
+            hooks.get(self.agent, ro.id), file_state, ro.state_ts or ro.mtime)
+        return s
 
 
 def resolve_status(ev: Optional[dict], file_state: str, file_ts: float):
@@ -484,8 +542,14 @@ class Monitor:
                 self.since[key] = (s.status, s.status_since or now)
             s.status_since = self.since[key][1]
             self.known[key] = s
+        live_pids = {(s.agent, s.pid) for s in live if s.pid}
         for key, s in list(self.known.items()):
             if key in live_keys:
+                continue
+            if s.pid and (s.agent, s.pid) in live_pids:
+                # Same process, new session id (Claude /clear, Codex's first prompt): not an exit.
+                del self.known[key]
+                self.since.pop(key, None)
                 continue
             if s.exited_at is None:
                 s.exited_at, s.status, s.status_since = now, EXITED, now
