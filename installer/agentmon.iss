@@ -25,7 +25,6 @@ RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "startup"; Description: "Start agentmon when I sign in"; GroupDescription: "Additional options:"; Flags: checkedonce
