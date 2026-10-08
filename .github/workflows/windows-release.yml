@@ -1,4 +1,4 @@
-name: Build Windows executable
+name: Build release packages
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       tag:
         description: "Release tag to create or update"
         required: true
-        default: "v0.2.0"
+        default: "v0.3.0"
   push:
     tags:
       - "v*"
@@ -14,15 +14,16 @@ on:
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
 jobs:
   windows:
     runs-on: windows-latest
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -56,12 +57,116 @@ jobs:
           $version = $env:RELEASE_TAG -replace '^v', ''
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" installer\agentmon.iss
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agentmon-windows
           path: |
             dist/agentmon-tray.exe
             dist/agentmon-setup.exe
+          if-no-files-found: error
+
+  ubuntu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Test
+        run: python -m unittest -v test_agentmon.py
+
+      - name: Install packager
+        run: python -m pip install --disable-pip-version-check pyinstaller==6.16.0
+
+      - name: Build portable executable
+        run: |
+          pyinstaller --noconfirm --clean --distpath dist/cli --workpath build/cli agentmon_cli.spec
+          install -Dm0755 dist/cli/agentmon dist/release/agentmon-linux-x86_64
+
+      - name: Smoke-test portable executable
+        run: dist/release/agentmon-linux-x86_64 once
+
+      - name: Build Ubuntu package
+        run: packaging/build_ubuntu_deb.sh "$RELEASE_TAG" amd64
+
+      - name: Inspect Ubuntu package
+        run: dpkg-deb --info dist/*.deb
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentmon-ubuntu
+          path: |
+            dist/agentmon-linux-x86_64
+            dist/*.deb
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Test
+        run: python -m unittest -v test_agentmon.py
+
+      - name: Install packager
+        run: python -m pip install --disable-pip-version-check pyinstaller==6.16.0 pyobjc-framework-Cocoa
+
+      - name: Build command-line executable and menu-bar application
+        run: |
+          pyinstaller --noconfirm --clean --distpath dist/cli --workpath build/cli agentmon_cli.spec
+          pyinstaller --noconfirm --clean --distpath dist/tray --workpath build/tray agentmon_tray_macos.spec
+          mkdir -p dist/release
+          cp dist/cli/agentmon "dist/release/agentmon-macos-${{ matrix.arch }}"
+          chmod 0755 "dist/release/agentmon-macos-${{ matrix.arch }}"
+
+      - name: Ad-hoc sign and inspect application
+        run: |
+          codesign --force --deep --sign - dist/tray/agentmon.app
+          codesign --verify --deep --strict dist/tray/agentmon.app
+          plutil -lint dist/tray/agentmon.app/Contents/Info.plist
+
+      - name: Smoke-test command-line executable
+        run: "dist/release/agentmon-macos-${{ matrix.arch }} once"
+
+      - name: Build disk image
+        run: |
+          mkdir -p dist/dmg
+          cp -R dist/tray/agentmon.app dist/dmg/
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname agentmon -srcfolder dist/dmg -ov -format UDZO "dist/release/agentmon-macos-${{ matrix.arch }}.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentmon-macos-${{ matrix.arch }}
+          path: |
+            dist/release/agentmon-macos-${{ matrix.arch }}
+            dist/release/agentmon-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [windows, ubuntu, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: agentmon-*
+          path: release
+          merge-multiple: true
 
       - name: Attach files to GitHub release
         uses: softprops/action-gh-release@v3
@@ -70,6 +175,5 @@ jobs:
           name: agentmon ${{ env.RELEASE_TAG }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
-          files: |
-            dist/agentmon-tray.exe
-            dist/agentmon-setup.exe
+          fail_on_unmatched_files: true
+          files: release/*

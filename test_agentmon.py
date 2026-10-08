@@ -1,12 +1,15 @@
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
 import agentmon as am
+import agentmon_tray_macos as mactray
 import agentmon_tray_windows as wintray
 
 
@@ -154,6 +157,20 @@ class TargetTest(unittest.TestCase):
         else:
             self.assertEqual(kwargs, {})
 
+    def test_macos_pid_and_codex_process_detection(self):
+        with mock.patch.object(am.sys, "platform", "darwin"), \
+                mock.patch.object(am.os, "kill") as kill:
+            self.assertTrue(am.pid_alive(123))
+            kill.assert_called_once_with(123, 0)
+
+        ps = types.SimpleNamespace(stdout=(
+            " 101 /opt/homebrew/bin/codex\n"
+            " 202 /usr/local/bin/codex-aarch64-apple-darwin\n"
+            " 303 /bin/bash\n"))
+        with mock.patch.object(am.sys, "platform", "darwin"), \
+                mock.patch.object(am.subprocess, "run", return_value=ps):
+            self.assertEqual(am.codex_pids(), [101, 202])
+
     def test_parse_and_commands(self):
         self.assertEqual(am.parse_target("local").label, "local")
         wsl = am.parse_target("wsl:Ubuntu-24.04")
@@ -245,6 +262,43 @@ class WindowsTrayLogicTest(unittest.TestCase):
                                  "--target", "wsl"])
 
 
+class MacTrayLogicTest(unittest.TestCase):
+    def session(self, status, sid="s"):
+        return am.Session(agent="codex", id=sid, status=status)
+
+    def test_overall_state_and_status_title(self):
+        rows = [self.session(am.IDLE, "idle"), self.session(am.PROCESSING, "busy")]
+        self.assertEqual(mactray.overall_state(rows), am.PROCESSING)
+        self.assertEqual(mactray.status_title(rows), "🟡 1 busy")
+        rows.append(self.session(am.WAITING, "wait"))
+        self.assertEqual(mactray.overall_state(rows), am.WAITING)
+        self.assertEqual(mactray.status_title(rows), "🔴 1 waiting 1 busy")
+
+    def test_attention_transition(self):
+        attention = mactray.Attention()
+        attention.update([self.session(am.PROCESSING)], 1)
+        events = attention.update([self.session(am.WAITING)], 2)
+        self.assertEqual([event for event, _ in events], ["waiting"])
+        self.assertTrue(attention.blinking())
+        events = attention.update([self.session(am.IDLE)], 3)
+        self.assertEqual([event for event, _ in events], ["finished"])
+
+    def test_start_at_login_uses_frozen_application(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launch_agent = os.path.join(tmp, "dev.agentmon.tray.plist")
+            executable = "/Applications/agentmon.app/Contents/MacOS/agentmon"
+            with mock.patch.object(mactray, "LAUNCH_AGENT", launch_agent), \
+                    mock.patch.object(mactray.sys, "frozen", True, create=True), \
+                    mock.patch.object(mactray.sys, "executable", executable):
+                mactray.set_start_at_login(True)
+                with open(launch_agent, "rb") as f:
+                    data = plistlib.load(f)
+                self.assertEqual(data["ProgramArguments"], [executable])
+                self.assertTrue(data["RunAtLoad"])
+                mactray.set_start_at_login(False)
+                self.assertFalse(os.path.exists(launch_agent))
+
+
 class ResolveStatusTest(unittest.TestCase):
     def test_no_hooks_uses_file_state(self):
         self.assertEqual(am.resolve_status(None, am.PROCESSING, 10), (am.PROCESSING, 10))
@@ -267,6 +321,15 @@ class ResolveStatusTest(unittest.TestCase):
 
 
 class HookInstallTest(unittest.TestCase):
+    def test_frozen_executable_is_used_as_hook_command(self):
+        executable = os.path.join(os.sep, "opt", "agentmon")
+        with mock.patch.object(am.sys, "frozen", True, create=True), \
+                mock.patch.object(am.sys, "executable", executable):
+            cmd = am.hook_command("codex")
+        self.assertIn(executable, cmd)
+        self.assertIn("hook --agent codex", cmd)
+        self.assertTrue(am.is_agentmon_command(cmd))
+
     def test_install_is_idempotent_and_keeps_existing(self):
         other = {"type": "command", "command": "/bin/redock-hook agent-event"}
         cfg = {"theme": "dark", "hooks": {"Stop": [{"hooks": [other]}]}}

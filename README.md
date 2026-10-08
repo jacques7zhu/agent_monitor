@@ -45,7 +45,7 @@ put ports, identity files, jump hosts, and other options in `~/.ssh/config`.
 Python 3 must be available as `python3` inside WSL and on SSH hosts.
 
 For a persistent setup, create `%APPDATA%\agentmon\targets.json` on Windows or
-`~/.config/agentmon/targets.json` on Linux:
+`~/.config/agentmon/targets.json` on Linux and macOS:
 
 ```json
 {
@@ -114,12 +114,11 @@ default WSL distribution. Right-click the tray icon to inspect sessions or
 quit. Windows may put a newly installed icon under the notification area's `^`
 overflow button until it is pinned.
 
-Maintainers can produce both files from the repository's **Build Windows
-executable** GitHub Actions workflow. A manual workflow run asks for a release
-tag (default `v0.2.0`), uploads the `agentmon-windows` artifact, creates or
-updates that GitHub Release, and attaches both EXEs. Pushing a `v*` tag does the
-same automatically. The build recipe is `agentmon_tray.spec`, and the
-installer recipe is `installer/agentmon.iss`.
+Maintainers can produce all platform files from the repository's **Build
+release packages** GitHub Actions workflow. A manual workflow run asks for a
+release tag (default `v0.3.0`), creates or updates that GitHub Release, and
+attaches every Windows, Ubuntu, and macOS file. Pushing a `v*` tag does the
+same automatically.
 
 The generated files are not code-signed. Windows SmartScreen may therefore
 show an unrecognized-publisher warning until releases are signed with a trusted
@@ -136,6 +135,27 @@ python3 agentmon_tray.py                     # run it now (a second launch opens
 python3 agentmon_tray.py uninstall-desktop
 ```
 
+Ubuntu releases also include:
+
+- `agentmon_VERSION_amd64.deb` — installs the terminal command, top-bar
+  indicator, desktop launcher, and declares the required Ubuntu packages.
+- `agentmon-linux-x86_64` — self-contained portable terminal executable that
+  does not require Python.
+
+Install and launch the package with:
+
+```sh
+sudo apt install ./agentmon_0.3.0_amd64.deb
+agentmon-tray
+```
+
+Or run the portable terminal monitor:
+
+```sh
+chmod +x agentmon-linux-x86_64
+./agentmon-linux-x86_64 once
+```
+
 <p>
   <img src="docs/topbar.png" alt="agentmon in the Ubuntu top bar" height="56"><br>
   <img src="docs/menu.png" alt="agentmon indicator menu" width="480">
@@ -144,6 +164,38 @@ python3 agentmon_tray.py uninstall-desktop
 ![agentmon details window](docs/details.png)
 
 Use the TUI's `install-hooks` as well, so "waiting for approval" is detected exactly rather than guessed. The tray reads the same targets config and lists remote sessions too; jumping to a tmux pane is intentionally enabled only for local sessions.
+
+## macOS menu-bar application
+
+Choose `agentmon-macos-arm64.dmg` for Apple Silicon Macs or
+`agentmon-macos-x86_64.dmg` for Intel Macs. Open the disk image and drag
+`agentmon.app` to Applications. The menu-bar item uses the same red, amber,
+green, and grey states as the other tray applications. Its menu lists live
+sessions, shows details, stops attention blinking, and can enable **Start at
+Login**.
+
+The release also contains matching standalone terminal executables named
+`agentmon-macos-arm64` and `agentmon-macos-x86_64`. They do not require
+Python:
+
+```sh
+chmod +x agentmon-macos-arm64
+./agentmon-macos-arm64 once
+```
+
+The macOS files are ad-hoc signed, not notarized. On first launch, macOS may
+require Control-clicking `agentmon.app`, choosing **Open**, and confirming.
+Configure SSH targets in `~/.config/agentmon/targets.json`; WSL targets are
+Windows-only.
+
+## Release files
+
+| Platform | Installable app/package | Portable executable |
+|---|---|---|
+| Windows x64 | `agentmon-setup.exe` | `agentmon-tray.exe` |
+| Ubuntu x86_64 | `agentmon_VERSION_amd64.deb` | `agentmon-linux-x86_64` |
+| macOS Apple Silicon | `agentmon-macos-arm64.dmg` | `agentmon-macos-arm64` |
+| macOS Intel | `agentmon-macos-x86_64.dmg` | `agentmon-macos-x86_64` |
 
 ## Where the data comes from
 

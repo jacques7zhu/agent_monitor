@@ -119,8 +119,19 @@ def pid_alive(pid) -> bool:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
-    if os.name != "nt":
+    if sys.platform.startswith("linux"):
         return os.path.exists("/proc/%d" % pid)
+
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except (OSError, ValueError):
+            return False
 
     # os.kill(pid, 0) is not a portable existence check on Windows. Querying a
     # limited-information handle works without optional packages or admin rights.
@@ -397,6 +408,27 @@ class CodexRollout:
 
 
 def codex_pids() -> List[int]:
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["ps", "-axo", "pid=,comm="], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=3, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        pids = []
+        for line in proc.stdout.splitlines():
+            cols = line.strip().split(None, 1)
+            if len(cols) != 2:
+                continue
+            name = os.path.basename(cols[1]).lower()
+            if name == "codex" or name.startswith("codex-"):
+                try:
+                    pids.append(int(cols[0]))
+                except ValueError:
+                    pass
+        return pids
+
     if os.name == "nt":
         try:
             proc = subprocess.run(
@@ -1234,7 +1266,10 @@ def cmd_hook(args):
 
 
 def hook_command(agent):
-    parts = [sys.executable, os.path.abspath(__file__), "hook", "--agent", agent]
+    if getattr(sys, "frozen", False):
+        parts = [sys.executable, "hook", "--agent", agent]
+    else:
+        parts = [sys.executable, os.path.abspath(__file__), "hook", "--agent", agent]
     if os.name == "nt":
         return subprocess.list2cmdline(parts)
     return " ".join(shlex.quote(part) for part in parts)
@@ -1242,7 +1277,7 @@ def hook_command(agent):
 
 def is_agentmon_command(cmd):
     cmd = cmd or ""
-    return "agentmon.py" in cmd and "hook --agent" in cmd
+    return "agentmon" in cmd.lower() and "hook --agent" in cmd
 
 
 def _load_json(path):
