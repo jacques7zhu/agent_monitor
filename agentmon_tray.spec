@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller recipe for the standalone Windows tray executable."""
 from pathlib import Path
+import sys
 
-import agentmon_tray_windows as tray
+# PyInstaller intentionally does not add the spec directory to sys.path.
+# Resolve all inputs from SPEC so this also works when invoked from elsewhere.
+root = Path(SPEC).resolve().parent
+sys.path.insert(0, str(root))
 
+import agentmon_tray_windows as tray  # noqa: E402
 
-root = Path.cwd()
 build_assets = root / "build" / "windows-assets"
 build_assets.mkdir(parents=True, exist_ok=True)
 app_icon = build_assets / "agentmon.ico"
