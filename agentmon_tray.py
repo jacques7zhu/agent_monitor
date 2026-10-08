@@ -87,12 +87,17 @@ def write_icons():
 
 
 def session_key(s):
-    return (s.agent, s.id)
+    return (s.target, s.agent, s.id)
+
+
+def session_key_text(s):
+    return "/".join(session_key(s))
 
 
 def session_label(s, now):
     age = am.fmt_age(now - s.status_since) if s.status_since else ""
-    return "%s %s · %s — %s %s" % (DOT.get(s.status, "•"), s.agent, s.name or s.id[:8], s.status, age)
+    return "%s %s · %s · %s — %s %s" % (
+        DOT.get(s.status, "•"), s.target, s.agent, s.name or s.id[:8], s.status, age)
 
 
 def jump_to_tmux(target):
@@ -166,7 +171,7 @@ class Attention:
 
 
 class DetailsWindow(Gtk.Window):
-    COLS = ["Agent", "Name", "Model", "Status", "For", "In", "Cached", "Out", "Ctx", "PID", "tmux"]
+    COLS = ["Target", "Agent", "Name", "Model", "Status", "For", "In", "Cached", "Out", "Ctx", "PID", "tmux"]
 
     def __init__(self, app):
         super().__init__(title="agentmon")
@@ -231,12 +236,12 @@ class DetailsWindow(Gtk.Window):
 
     def update(self, sessions, now, codex_limits):
         sel = self.selected()
-        keep = self.wanted_key or (("%s/%s" % session_key(sel)) if sel else None)
-        self.sessions = {"%s/%s" % session_key(s): s for s in sessions}
+        keep = self.wanted_key or (session_key_text(sel) if sel else None)
+        self.sessions = {session_key_text(s): s for s in sessions}
         rows = []
         for s in sorted(sessions, key=am.SORTS[0][1]):
             vals = [str(get(s, now)) for _, _, get in am.COLUMNS]
-            rows.append(vals + [COLORS.get(s.status, "#888888"), "%s/%s" % session_key(s)])
+            rows.append(vals + [COLORS.get(s.status, "#888888"), session_key_text(s)])
         # Update in place so the selection and scroll position survive refreshes.
         if len(self.store) != len(rows) or any(
                 self.store[i][len(self.COLS) + 1] != r[-1] for i, r in enumerate(rows)):
@@ -259,12 +264,14 @@ class DetailsWindow(Gtk.Window):
         self.show_detail()
 
     def select(self, key):
-        self.wanted_key = "%s/%s" % key
+        if len(key) == 2:  # backward-compatible convenience for local sessions
+            key = ("local",) + tuple(key)
+        self.wanted_key = "/".join(key)
 
     def show_detail(self):
         s = self.selected()
         buf = self.detail.get_buffer()
-        self.jump_btn.set_sensitive(bool(s and s.tmux))
+        self.jump_btn.set_sensitive(bool(s and s.tmux and s.target == "local"))
         text_now = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
         if s is None:
             if text_now:
@@ -272,7 +279,8 @@ class DetailsWindow(Gtk.Window):
             return
         now = time.time()
         rows = [
-            ("Session", s.id), ("Directory", s.cwd), ("Model", s.model or "-"),
+            ("Target", s.target), ("Session", s.id), ("Directory", s.cwd),
+            ("Model", s.model or "-"),
             ("Status", "%s for %s" % (s.status, am.fmt_age(now - s.status_since))),
             ("Tokens", "in %s · cached %s · out %s · context %s / %s" % (
                 am.fmt_tokens(s.tokens_in), am.fmt_tokens(s.tokens_cached), am.fmt_tokens(s.tokens_out),
@@ -291,7 +299,7 @@ class DetailsWindow(Gtk.Window):
 
     def on_jump(self):
         s = self.selected()
-        if s and s.tmux and not jump_to_tmux(s.tmux):
+        if s and s.target == "local" and s.tmux and not jump_to_tmux(s.tmux):
             self.summary.set_text("could not switch to tmux pane %s" % s.tmux)
 
     def on_copy(self):
@@ -303,7 +311,7 @@ class DetailsWindow(Gtk.Window):
 class TrayApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
-        self.monitor = am.Monitor()
+        self.monitor = am.monitor_for_targets()
         self.attention = Attention()
         self.sessions = []
         self.window = None
@@ -349,7 +357,7 @@ class TrayApp(Gtk.Application):
         self.update_menu(now)
         self.update_icon()
         if self.window is not None and self.window.get_visible():
-            self.window.update(self.sessions, now, self.monitor.codex.rate_limits)
+            self.window.update(self.sessions, now, self.monitor.rate_limits)
         return True
 
     # -- top bar icon + label
@@ -430,6 +438,9 @@ class TrayApp(Gtk.Application):
             if item is not None and item.get_label() != label:
                 item.set_label(label)
         header = " · ".join(l.split("  tokens")[0] for l in am.summary_lines(self.sessions, None))
+        errors = self.monitor.remote_errors()
+        if errors:
+            header += " · %d target issue%s" % (len(errors), "s" if len(errors) != 1 else "")
         if self.header_item.get_label() != header:
             self.header_item.set_label(header)
 
@@ -447,7 +458,7 @@ class TrayApp(Gtk.Application):
             self.add_window(self.window)
         if key:
             self.window.select(key)
-        self.window.update(self.sessions, time.time(), self.monitor.codex.rate_limits)
+        self.window.update(self.sessions, time.time(), self.monitor.rate_limits)
         self.window.show_all()
         self.window.present()
 
@@ -457,17 +468,17 @@ class TrayApp(Gtk.Application):
             return
         if kind == "waiting":
             title = "%s needs approval" % s.agent.capitalize()
-            body = "%s — %s" % (s.name, am.short(s.cwd, 80))
+            body = "%s · %s — %s" % (s.target, s.name, am.short(s.cwd, 80))
             urgency = Notify.Urgency.CRITICAL
         else:
-            title = "%s finished · %s" % (s.agent.capitalize(), s.name)
+            title = "%s finished · %s · %s" % (s.agent.capitalize(), s.target, s.name)
             body = am.short(s.last_message or s.cwd, 160)
             urgency = Notify.Urgency.NORMAL
         n = Notify.Notification.new(title, body, "utilities-system-monitor")
         n.set_urgency(urgency)
         n.add_action("default", "Show details", lambda *_: self.on_session_item(None, session_key(s)))
         n.add_action("details", "Show details", lambda *_: self.on_session_item(None, session_key(s)))
-        if s.tmux:
+        if s.tmux and s.target == "local":
             n.add_action("tmux", "Go to pane", lambda *_: jump_to_tmux(s.tmux))
         try:
             n.show()

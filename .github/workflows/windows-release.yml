@@ -1,0 +1,63 @@
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test
+        shell: pwsh
+        run: python -m unittest -v test_agentmon.py
+
+      - name: Install packager
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check pyinstaller==6.16.0
+
+      - name: Build portable executable
+        shell: pwsh
+        run: pyinstaller --noconfirm --clean agentmon_tray.spec
+
+      - name: Smoke-test portable executable
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath .\dist\agentmon-tray.exe -ArgumentList '--help' -PassThru
+          if (-not $process.WaitForExit(15000)) {
+            $process.Kill()
+            throw 'agentmon-tray.exe did not exit during smoke test'
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "agentmon-tray.exe exited with code $($process.ExitCode)"
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\agentmon.iss'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentmon-windows
+          path: |
+            dist/agentmon-tray.exe
+            dist/agentmon-setup.exe
+
+      - name: Attach files to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agentmon-tray.exe
+            dist/agentmon-setup.exe

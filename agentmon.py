@@ -4,22 +4,31 @@
 Shows every live session with its status (processing / waiting for approval /
 idle / exited) and token usage. Pure stdlib; Python 3.8+.
 
-    agentmon.py [tui]            interactive dashboard (default)
+    agentmon.py [--target TARGET] [tui]  interactive dashboard (default)
     agentmon.py once             print the table once and exit
+    agentmon.py watch            portable live dashboard (including Windows)
     agentmon.py install-hooks    add agentmon hooks to Claude Code and Codex
     agentmon.py uninstall-hooks  remove them again
     agentmon.py hook --agent X   (called by the hooks; logs one event)
 """
 import argparse
-import curses
+import atexit
 import glob
 import json
 import os
+import shlex
 import shutil
+import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, fields
 from typing import Dict, List, Optional
+
+try:
+    import curses
+except ImportError:  # The Windows stdlib does not bundle curses.
+    curses = None
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -28,6 +37,10 @@ STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")), "agentmon"
 )
 EVENTS_FILE = os.path.join(STATE_DIR, "events.jsonl")
+CONFIG_HOME = (os.environ.get("XDG_CONFIG_HOME")
+               or (os.environ.get("APPDATA") if os.name == "nt" else None)
+               or os.path.join(HOME, ".config"))
+TARGETS_FILE = os.path.join(CONFIG_HOME, "agentmon", "targets.json")
 
 PROCESSING = "processing"
 WAITING = "waiting"
@@ -77,6 +90,7 @@ class Session:
     last_prompt: str = ""
     last_message: str = ""
     exited_at: Optional[float] = None
+    target: str = "local"
 
 
 def hook_event_state(ev: dict) -> Optional[str]:
@@ -92,7 +106,32 @@ def hook_event_state(ev: dict) -> Optional[str]:
 
 
 def pid_alive(pid) -> bool:
-    return bool(pid) and os.path.exists("/proc/%d" % int(pid))
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if os.name != "nt":
+        return os.path.exists("/proc/%d" % pid)
+
+    # os.kill(pid, 0) is not a portable existence check on Windows. Querying a
+    # limited-information handle works without optional packages or admin rights.
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def parse_ts(s) -> float:
@@ -351,6 +390,27 @@ class CodexRollout:
 
 
 def codex_pids() -> List[int]:
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq codex.exe", "/FO", "CSV", "/NH"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                timeout=3, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        pids = []
+        for line in proc.stdout.splitlines():
+            # tasklist CSV starts with "image.exe","1234",... . Avoid the csv
+            # module here because localized error lines are not CSV records.
+            cols = [part.strip().strip('"') for part in line.split(",")]
+            if len(cols) > 1 and cols[0].lower() == "codex.exe":
+                try:
+                    pids.append(int(cols[1]))
+                except ValueError:
+                    pass
+        return pids
+
     pids = []
     for proc in glob.glob("/proc/[0-9]*"):
         try:
@@ -518,35 +578,281 @@ def resolve_status(ev: Optional[dict], file_state: str, file_ts: float):
     return file_state, file_ts
 
 
+# --------------------------------------------------------------------------- targets
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    kind: str
+    value: str
+    label: str
+
+    def command(self, watch=1.0):
+        remote_args = ["python3", "-u", "-", "snapshot", "--watch", str(watch)]
+        if self.kind == "wsl":
+            cmd = ["wsl.exe"]
+            if self.value:
+                cmd += ["-d", self.value]
+            return cmd + ["--"] + remote_args
+        if self.kind == "ssh":
+            return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                    self.value] + remote_args
+        raise ValueError("local targets do not have a remote command")
+
+
+def parse_target(spec: str) -> TargetSpec:
+    """Parse local, wsl[:distro], or ssh:host without invoking a shell."""
+    spec = (spec or "").strip()
+    if spec == "local":
+        return TargetSpec("local", "", "local")
+    if spec == "wsl":
+        return TargetSpec("wsl", "", "wsl")
+    kind, sep, value = spec.partition(":")
+    if kind not in ("wsl", "ssh") or not sep or not value.strip():
+        raise ValueError("invalid target %r (use local, wsl[:DISTRO], or ssh:HOST)" % spec)
+    value = value.strip()
+    if value.startswith("-") or any(c in value for c in "\r\n\0"):
+        raise ValueError("unsafe target value %r" % value)
+    return TargetSpec(kind, value, "%s/%s" % (kind, value))
+
+
+def configured_target_specs(cli_targets=None):
+    """Return target strings from CLI, environment, config, or the local default."""
+    raw = cli_targets
+    if not raw and os.environ.get("AGENTMON_TARGETS"):
+        raw = [s.strip() for s in os.environ["AGENTMON_TARGETS"].split(",") if s.strip()]
+    if not raw and os.path.exists(TARGETS_FILE):
+        try:
+            with open(TARGETS_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+            raw = cfg if isinstance(cfg, list) else cfg.get("targets")
+        except (OSError, ValueError, AttributeError) as e:
+            raise ValueError("could not read %s: %s" % (TARGETS_FILE, e))
+    raw = raw or ["local"]
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise ValueError("targets must be a list of strings")
+    out = []
+    seen = set()
+    for item in raw:
+        target = parse_target(item)
+        key = (target.kind, target.value)
+        if key not in seen:
+            out.append(target)
+            seen.add(key)
+    return out
+
+
+def collector_source_path():
+    """Locate source sent to WSL/SSH, including inside a PyInstaller bundle."""
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        bundled = os.path.join(bundle_dir, "agentmon.py")
+        if os.path.isfile(bundled):
+            return bundled
+    return os.path.abspath(__file__)
+
+
+class RemoteTarget:
+    """A persistent WSL/SSH worker that streams JSON snapshots.
+
+    The current agentmon source is sent over stdin and executed with ``python3 -``.
+    That keeps setup zero-install and guarantees the collector matches the client.
+    """
+
+    PROTOCOL = 1
+    STALE_AFTER = 5
+
+    def __init__(self, spec: TargetSpec, source_path=None):
+        if spec.kind == "local":
+            raise ValueError("RemoteTarget requires wsl or ssh")
+        self.spec = spec
+        self.source_path = source_path or collector_source_path()
+        self.rate_limits = None
+        self.last_error = ""
+        self._sessions = []
+        self._received_at = 0.0
+        self._proc = None
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._retry_at = 0.0
+        self._closed = False
+        self._stderr_lines = []
+        atexit.register(self.close)
+
+    def start(self):
+        with self._lock:
+            if self._closed or (self._proc is not None and self._proc.poll() is None):
+                return
+            if time.time() < self._retry_at:
+                return
+            self._retry_at = time.time() + 2
+            self._ready.clear()
+            self._stderr_lines = []
+            try:
+                proc = subprocess.Popen(
+                    self.spec.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                    bufsize=1,
+                )
+                self._proc = proc
+            except OSError as e:
+                self.last_error = str(e)
+                self._ready.set()
+                return
+
+        threading.Thread(target=self._read_stdout, args=(proc,), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(proc,), daemon=True).start()
+        try:
+            with open(self.source_path, encoding="utf-8") as f:
+                source = f.read()
+            proc.stdin.write(source)
+            proc.stdin.close()
+        except (OSError, BrokenPipeError) as e:
+            with self._lock:
+                self.last_error = str(e)
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    def _read_stdout(self, proc):
+        try:
+            for line in proc.stdout:
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue  # tolerate login banners written to stdout
+                self._accept_snapshot(data)
+        except (OSError, ValueError) as e:
+            with self._lock:
+                self.last_error = str(e)
+        finally:
+            try:
+                rc = proc.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                rc = None
+            with self._lock:
+                if self._proc is proc:
+                    self._proc = None
+                    if not self._closed and not self.last_error:
+                        detail = " · ".join(self._stderr_lines[-2:])
+                        self.last_error = detail or "remote collector exited%s" % (
+                            " (%s)" % rc if rc is not None else "")
+            self._ready.set()
+
+    def _accept_snapshot(self, data):
+        if not isinstance(data, dict) or data.get("agentmon_snapshot") != self.PROTOCOL:
+            return False
+        valid = {f.name for f in fields(Session)}
+        sessions = []
+        received_at = time.time()
+        generated_at = data.get("generated_at")
+        clock_offset = (received_at - generated_at
+                        if isinstance(generated_at, (int, float)) else 0)
+        for row in data.get("sessions") or []:
+            if not isinstance(row, dict):
+                continue
+            values = {k: v for k, v in row.items() if k in valid}
+            if not values.get("agent") or not values.get("id"):
+                continue
+            values["target"] = self.spec.label
+            for key in ("status_since", "last_activity", "exited_at"):
+                if isinstance(values.get(key), (int, float)) and values[key]:
+                    values[key] += clock_offset
+            sessions.append(Session(**values))
+        with self._lock:
+            self._sessions = sessions
+            self.rate_limits = data.get("rate_limits")
+            self._received_at = received_at
+            self.last_error = ""
+        self._ready.set()
+        return True
+
+    def _read_stderr(self, proc):
+        try:
+            for line in proc.stderr:
+                line = line.strip()
+                if line:
+                    with self._lock:
+                        self._stderr_lines = (self._stderr_lines + [line])[-5:]
+        except OSError:
+            pass
+
+    def wait_ready(self, timeout):
+        self.start()
+        return self._ready.wait(timeout)
+
+    def sessions(self, now):
+        self.start()
+        with self._lock:
+            # Once a dead connection's last result is stale, let Monitor mark its
+            # rows exited instead of presenting old state as live indefinitely.
+            proc_alive = self._proc is not None and self._proc.poll() is None
+            if not proc_alive and self._received_at and now - self._received_at > self.STALE_AFTER:
+                return []
+            return [Session(**asdict(s)) for s in self._sessions]
+
+    def error(self):
+        with self._lock:
+            if self.last_error:
+                return self.last_error
+            if not self._received_at:
+                return "connecting"
+            return ""
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            proc = self._proc
+            self._proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+
 # --------------------------------------------------------------------------- Monitor
 
 
 class Monitor:
-    def __init__(self, claude=None, codex=None, hooks=None):
+    def __init__(self, claude=None, codex=None, hooks=None, remotes=None, include_local=True):
         self.hooks = hooks or HookEvents()
         self.claude = claude or ClaudeSource()
         self.codex = codex or CodexSource()
+        self.remotes = remotes or []
+        self.include_local = include_local
+        self.rate_limits = None
         self.known: Dict[tuple, Session] = {}
         self.since: Dict[tuple, tuple] = {}  # key -> (status, first seen at)
 
     def refresh(self, now=None) -> List[Session]:
         now = now or time.time()
-        self.hooks.refresh()
-        live = self.claude.sessions(self.hooks, now) + self.codex.sessions(self.hooks, now)
+        live = []
+        if self.include_local:
+            self.hooks.refresh()
+            live = self.claude.sessions(self.hooks, now) + self.codex.sessions(self.hooks, now)
+            for s in live:
+                s.target = "local"
+            self.rate_limits = self.codex.rate_limits
+        for remote in self.remotes:
+            live += remote.sessions(now)
+            if remote.rate_limits and self.rate_limits is None:
+                self.rate_limits = remote.rate_limits
         live_keys = set()
         for s in live:
-            key = (s.agent, s.id)
+            key = (s.target, s.agent, s.id)
             live_keys.add(key)
             prev = self.since.get(key)
             if prev is None or prev[0] != s.status:
                 self.since[key] = (s.status, s.status_since or now)
             s.status_since = self.since[key][1]
             self.known[key] = s
-        live_pids = {(s.agent, s.pid) for s in live if s.pid}
+        live_pids = {(s.target, s.agent, s.pid) for s in live if s.pid}
         for key, s in list(self.known.items()):
             if key in live_keys:
                 continue
-            if s.pid and (s.agent, s.pid) in live_pids:
+            if s.pid and (s.target, s.agent, s.pid) in live_pids:
                 # Same process, new session id (Claude /clear, Codex's first prompt): not an exit.
                 del self.known[key]
                 self.since.pop(key, None)
@@ -557,6 +863,29 @@ class Monitor:
                 del self.known[key]
                 self.since.pop(key, None)
         return list(self.known.values())
+
+    def start_remotes(self):
+        for remote in self.remotes:
+            remote.start()
+
+    def wait_remotes(self, timeout=7):
+        deadline = time.time() + timeout
+        self.start_remotes()
+        for remote in self.remotes:
+            remote.wait_ready(max(0, deadline - time.time()))
+
+    def remote_errors(self):
+        return {remote.spec.label: remote.error() for remote in self.remotes if remote.error()}
+
+    def close(self):
+        for remote in self.remotes:
+            remote.close()
+
+
+def monitor_for_targets(cli_targets=None):
+    specs = configured_target_specs(cli_targets)
+    remotes = [RemoteTarget(s) for s in specs if s.kind != "local"]
+    return Monitor(remotes=remotes, include_local=any(s.kind == "local" for s in specs))
 
 
 # --------------------------------------------------------------------------- formatting
@@ -581,6 +910,7 @@ def fmt_age(secs) -> str:
 
 
 COLUMNS = [  # header, width, getter(session, now)
+    ("TARGET", 16, lambda s, now: s.target),
     ("AGENT", 6, lambda s, now: s.agent),
     ("NAME", 24, lambda s, now: s.name),
     ("MODEL", 16, lambda s, now: s.model),
@@ -596,10 +926,10 @@ COLUMNS = [  # header, width, getter(session, now)
 
 STATUS_ORDER = {WAITING: 0, WAITING_GUESS: 1, PROCESSING: 2, IDLE: 3, EXITED: 4}
 SORTS = [
-    ("status", lambda s: (STATUS_ORDER.get(s.status, 9), s.agent, s.name)),
+    ("status", lambda s: (STATUS_ORDER.get(s.status, 9), s.target, s.agent, s.name)),
     ("activity", lambda s: -s.last_activity),
     ("tokens", lambda s: -(s.tokens_in + s.tokens_cached + s.tokens_out)),
-    ("name", lambda s: (s.agent, s.name)),
+    ("name", lambda s: (s.target, s.agent, s.name)),
 ]
 
 
@@ -625,7 +955,10 @@ def summary_lines(sessions: List[Session], codex_limits) -> List[str]:
         tot = sum(s.tokens_in + s.tokens_cached + s.tokens_out for s in ss)
         parts = ", ".join("%d %s" % (counts[k], k) for k in sorted(counts, key=lambda k: STATUS_ORDER.get(k, 9)))
         line = "%-6s %d live (%s)  tokens %s" % (agent, len(ss), parts or "none", fmt_tokens(tot))
-        if agent == "codex" and codex_limits:
+        # A single unlabeled limits value is only meaningful when the displayed
+        # Codex rows come from one machine. Do not imply that one host's quota is
+        # an aggregate when several targets are present.
+        if agent == "codex" and codex_limits and len({s.target for s in ss}) <= 1:
             lim = []
             for key in ("primary", "secondary"):
                 w = codex_limits.get(key) or {}
@@ -639,27 +972,81 @@ def summary_lines(sessions: List[Session], codex_limits) -> List[str]:
     return lines
 
 
-def cmd_once(args):
-    mon = Monitor()
+def print_monitor(mon, clear=False):
     now = time.time()
     sessions = sorted(mon.refresh(now), key=SORTS[0][1])
-    for line in summary_lines(sessions, mon.codex.rate_limits):
+    if clear:
+        print("\033[2J\033[H", end="")
+    for line in summary_lines(sessions, mon.rate_limits):
         print(line)
     print()
     print(header_row())
     for s in sessions:
         print(format_row(s, now))
-    if not os.path.exists(EVENTS_FILE):
+    for target, error in mon.remote_errors().items():
+        print("\n%s: %s" % (target, error))
+    if mon.include_local and not os.path.exists(EVENTS_FILE):
         print("\n(no hook events yet - run `agentmon.py install-hooks` for exact approval detection)")
+
+
+def cmd_once(args):
+    try:
+        mon = monitor_for_targets(getattr(args, "targets", None))
+    except ValueError as e:
+        raise SystemExit("agentmon: %s" % e)
+    try:
+        mon.wait_remotes()
+        print_monitor(mon)
+    finally:
+        mon.close()
+
+
+def cmd_watch(args):
+    try:
+        mon = monitor_for_targets(getattr(args, "targets", None))
+    except ValueError as e:
+        raise SystemExit("agentmon: %s" % e)
+    try:
+        while True:
+            print_monitor(mon, clear=True)
+            print("\nrefreshing every %.1fs · Ctrl-C to quit" % args.interval)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        mon.close()
+
+
+def cmd_snapshot(args):
+    """Machine-readable local collector used by RemoteTarget."""
+    mon = Monitor()
+    try:
+        while True:
+            now = time.time()
+            payload = {
+                "agentmon_snapshot": RemoteTarget.PROTOCOL,
+                "generated_at": now,
+                "sessions": [asdict(s) for s in mon.refresh(now)],
+                "rate_limits": mon.rate_limits,
+            }
+            try:
+                print(json.dumps(payload, separators=(",", ":")), flush=True)
+            except BrokenPipeError:
+                return 0
+            if not args.watch:
+                return 0
+            time.sleep(args.watch)
+    finally:
+        mon.close()
 
 
 # --------------------------------------------------------------------------- TUI
 
 
 class TUI:
-    def __init__(self, scr):
+    def __init__(self, scr, monitor=None):
         self.scr = scr
-        self.mon = Monitor()
+        self.mon = monitor or Monitor()
         self.sel = 0
         self.sort = 0
         self.show_exited = True
@@ -732,16 +1119,20 @@ class TUI:
             time.strftime("%H:%M:%S"), SORTS[self.sort][0], "on" if self.bell else "off")
         self.put(0, 0, title.ljust(w), curses.A_REVERSE)
         y = 1
-        for line in summary_lines(sessions, self.mon.codex.rate_limits):
+        for line in summary_lines(sessions, self.mon.rate_limits):
             self.put(y, 1, line, curses.color_pair(4))
             y += 1
-        if not os.path.exists(EVENTS_FILE):
+        for target, error in self.mon.remote_errors().items():
+            self.put(y, 1, "%s: %s" % (target, error), curses.A_DIM)
+            y += 1
+        if self.mon.include_local and not os.path.exists(EVENTS_FILE):
             self.put(y, 1, "hooks not installed: approval state is a guess (run install-hooks)", curses.A_DIM)
             y += 1
         y += 1
         self.put(y, 1, header_row(), curses.A_BOLD | curses.A_UNDERLINE)
         y += 1
-        status_col = sum(wd + 1 for hdr, wd, _ in COLUMNS[:3]) + 1
+        status_index = next(i for i, col in enumerate(COLUMNS) if col[0] == "STATUS")
+        status_col = sum(wd + 1 for _, wd, _ in COLUMNS[:status_index]) + 1
         for i, s in enumerate(sessions):
             if y >= h - 1:
                 break
@@ -767,7 +1158,7 @@ class TUI:
         win.box()
         inner = bw - 4
         rows = [
-            ("session", s.id), ("cwd", s.cwd), ("model", s.model),
+            ("target", s.target), ("session", s.id), ("cwd", s.cwd), ("model", s.model),
             ("status", "%s for %s" % (s.status, fmt_age(now - s.status_since))),
             ("tokens", "in %s  cached %s  out %s  ctx %s/%s" % (
                 fmt_tokens(s.tokens_in), fmt_tokens(s.tokens_cached), fmt_tokens(s.tokens_out),
@@ -794,7 +1185,20 @@ class TUI:
 
 
 def cmd_tui(args):
-    curses.wrapper(lambda scr: TUI(scr).run())
+    if curses is None:
+        # Windows ships no curses module. The ANSI dashboard works in Windows
+        # Terminal/PowerShell; installing windows-curses restores key controls.
+        if not hasattr(args, "interval"):
+            args.interval = 1.0
+        return cmd_watch(args)
+    try:
+        mon = monitor_for_targets(getattr(args, "targets", None))
+    except ValueError as e:
+        raise SystemExit("agentmon: %s" % e)
+    try:
+        return curses.wrapper(lambda scr: TUI(scr, mon).run())
+    finally:
+        mon.close()
 
 
 # --------------------------------------------------------------------------- hooks
@@ -823,11 +1227,15 @@ def cmd_hook(args):
 
 
 def hook_command(agent):
-    return "%s %s hook --agent %s" % (sys.executable, os.path.abspath(__file__), agent)
+    parts = [sys.executable, os.path.abspath(__file__), "hook", "--agent", agent]
+    if os.name == "nt":
+        return subprocess.list2cmdline(parts)
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def is_agentmon_command(cmd):
-    return "agentmon.py hook --agent" in (cmd or "")
+    cmd = cmd or ""
+    return "agentmon.py" in cmd and "hook --agent" in cmd
 
 
 def _load_json(path):
@@ -907,17 +1315,33 @@ def cmd_uninstall_hooks(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Monitor Claude Code and Codex sessions.")
+    ap = argparse.ArgumentParser(
+        description="Monitor local, WSL, and SSH Claude Code/Codex sessions.",
+        epilog="TARGET is local, wsl, wsl:DISTRO, or ssh:HOST (repeatable).",
+    )
+    ap.add_argument("--target", action="append", dest="targets", metavar="TARGET",
+                    help="session source; may be repeated (default: config or local)")
     sub = ap.add_subparsers(dest="cmd")
-    sub.add_parser("tui", help="interactive dashboard (default)")
-    sub.add_parser("once", help="print the table once")
+    tui = sub.add_parser("tui", help="interactive dashboard (default)")
+    once = sub.add_parser("once", help="print the table once")
+    watch = sub.add_parser("watch", help="portable live dashboard; Ctrl-C to quit")
+    watch.add_argument("--interval", type=float, default=1.0, metavar="SECONDS")
+    for parser in (tui, once, watch):
+        parser.add_argument("--target", action="append", dest="targets", metavar="TARGET",
+                            default=argparse.SUPPRESS, help="session source; may be repeated")
     sub.add_parser("install-hooks", help="add agentmon hooks to Claude Code and Codex")
     sub.add_parser("uninstall-hooks", help="remove agentmon hooks")
     hp = sub.add_parser("hook", help="log one hook event (used by the hooks)")
     hp.add_argument("--agent", required=True, choices=["claude", "codex"])
+    snapshot = sub.add_parser("snapshot", help="internal JSON snapshot collector")
+    snapshot.add_argument("--watch", type=float, default=0, metavar="SECONDS",
+                          help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    if getattr(args, "interval", 1) <= 0 or getattr(args, "watch", 1) < 0:
+        ap.error("refresh intervals must be positive")
     handler = {
-        None: cmd_tui, "tui": cmd_tui, "once": cmd_once, "hook": cmd_hook,
+        None: cmd_tui, "tui": cmd_tui, "once": cmd_once, "watch": cmd_watch,
+        "snapshot": cmd_snapshot, "hook": cmd_hook,
         "install-hooks": cmd_install_hooks, "uninstall-hooks": cmd_uninstall_hooks,
     }[args.cmd]
     return handler(args) or 0

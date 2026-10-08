@@ -1,9 +1,12 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import agentmon as am
+import agentmon_tray_windows as wintray
 
 
 def write_jsonl(path, rows, mode="w"):
@@ -122,6 +125,116 @@ class MonitorSessionSwapTest(unittest.TestCase):
         self.assertEqual([s.id for s in mon.refresh(2)], ["real"])
         codex.rows = []
         self.assertEqual([(s.id, s.status) for s in mon.refresh(3)], [("real", am.EXITED)])
+
+    def test_same_session_id_on_two_targets_stays_distinct(self):
+        class Fake:
+            rate_limits = None
+
+            def __init__(self, rows):
+                self.rows = rows
+
+            def sessions(self, *args):
+                return [am.Session(**am.asdict(s)) for s in self.rows]
+
+        local = Fake([am.Session(agent="codex", id="same", pid=7)])
+        empty = Fake([])
+        remote = Fake([am.Session(agent="codex", id="same", target="ssh/prod", pid=7)])
+        mon = am.Monitor(claude=empty, codex=local, hooks=am.HookEvents(os.devnull),
+                         remotes=[remote])
+        rows = mon.refresh(1)
+        self.assertEqual({s.target for s in rows}, {"local", "ssh/prod"})
+
+
+class TargetTest(unittest.TestCase):
+    def test_parse_and_commands(self):
+        self.assertEqual(am.parse_target("local").label, "local")
+        wsl = am.parse_target("wsl:Ubuntu-24.04")
+        self.assertEqual(wsl.label, "wsl/Ubuntu-24.04")
+        self.assertEqual(wsl.command()[:4], ["wsl.exe", "-d", "Ubuntu-24.04", "--"])
+        ssh = am.parse_target("ssh:prod")
+        self.assertEqual(ssh.command()[-7:],
+                         ["prod", "python3", "-u", "-", "snapshot", "--watch", "1.0"])
+        with self.assertRaises(ValueError):
+            am.parse_target("ssh:-oProxyCommand=bad")
+
+    def test_remote_snapshot_is_tagged_and_unknown_fields_are_ignored(self):
+        remote = am.RemoteTarget(am.parse_target("ssh:prod"))
+        try:
+            ok = remote._accept_snapshot({
+                "agentmon_snapshot": 1,
+                "sessions": [{"agent": "claude", "id": "abc", "target": "wrong",
+                              "status": "processing", "future_field": 123}],
+                "rate_limits": {"primary": {"used_percent": 4}},
+            })
+            self.assertTrue(ok)
+            rows = [am.Session(**am.asdict(s)) for s in remote._sessions]
+            self.assertEqual([(s.target, s.agent, s.id) for s in rows],
+                             [("ssh/prod", "claude", "abc")])
+            self.assertEqual(remote.rate_limits["primary"]["used_percent"], 4)
+        finally:
+            remote.close()
+
+    def test_collector_can_be_streamed_over_stdin(self):
+        class LocalPipe:
+            kind = "ssh"
+            label = "test/pipe"
+
+            def command(self):
+                return [sys.executable, "-u", "-", "snapshot", "--watch", "0.05"]
+
+        remote = am.RemoteTarget(LocalPipe(), source_path=am.__file__)
+        try:
+            self.assertTrue(remote.wait_ready(3))
+            self.assertGreater(remote._received_at, 0)
+            self.assertEqual(remote.error(), "")
+        finally:
+            remote.close()
+
+    def test_bundled_collector_source_is_preferred(self):
+        with tempfile.TemporaryDirectory() as bundle:
+            bundled = os.path.join(bundle, "agentmon.py")
+            with open(bundled, "w") as f:
+                f.write("# bundled collector\n")
+            with mock.patch.object(am.sys, "_MEIPASS", bundle, create=True):
+                self.assertEqual(am.collector_source_path(), bundled)
+
+
+class WindowsTrayLogicTest(unittest.TestCase):
+    def session(self, status, sid="s"):
+        return am.Session(agent="codex", id=sid, target="wsl/Ubuntu", status=status)
+
+    def test_overall_state_and_tooltip(self):
+        rows = [self.session(am.IDLE, "idle"), self.session(am.PROCESSING, "busy")]
+        self.assertEqual(wintray.overall_state(rows), am.PROCESSING)
+        self.assertEqual(wintray.tray_tooltip(rows), "agentmon · 1 busy · 1 idle")
+        rows.append(self.session(am.WAITING, "wait"))
+        self.assertEqual(wintray.overall_state(rows), am.WAITING)
+
+    def test_attention_transition(self):
+        attention = wintray.Attention()
+        attention.update([self.session(am.PROCESSING)], 1)
+        events = attention.update([self.session(am.WAITING)], 2)
+        self.assertEqual([event for event, _ in events], ["waiting"])
+        self.assertTrue(attention.blinking())
+        events = attention.update([self.session(am.IDLE)], 3)
+        self.assertEqual([event for event, _ in events], ["finished"])
+
+    def test_generated_icon_is_valid_ico_container(self):
+        data = wintray._ico_bytes((255, 0, 0))
+        self.assertEqual(data[:6], b"\x00\x00\x01\x00\x01\x00")
+        self.assertGreater(len(data), 4000)
+
+    def test_first_tray_launch_defaults_to_wsl(self):
+        with mock.patch.dict(os.environ, {"AGENTMON_TARGETS": ""}), \
+                mock.patch.object(am, "TARGETS_FILE", os.path.join("missing", "targets.json")):
+            self.assertEqual(wintray.configured_tray_targets(None), ["wsl"])
+
+    def test_frozen_startup_runs_the_executable_itself(self):
+        with mock.patch.object(wintray.sys, "frozen", True, create=True), \
+                mock.patch.object(wintray.sys, "executable", os.path.join("C:\\", "agentmon.exe")):
+            parts = wintray.startup_parts(["wsl"])
+        self.assertEqual(parts, [os.path.abspath(os.path.join("C:\\", "agentmon.exe")),
+                                 "--target", "wsl"])
 
 
 class ResolveStatusTest(unittest.TestCase):
