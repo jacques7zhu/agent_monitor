@@ -70,6 +70,13 @@ CODEX_HOOK_EVENTS = [
 ]
 
 
+def hidden_subprocess_kwargs():
+    """Prevent helper commands from flashing a console window on Windows."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
+
 @dataclass
 class Session:
     agent: str
@@ -395,7 +402,7 @@ def codex_pids() -> List[int]:
             proc = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq codex.exe", "/FO", "CSV", "/NH"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                timeout=3, check=False,
+                timeout=3, check=False, **hidden_subprocess_kwargs()
             )
         except (OSError, subprocess.TimeoutExpired):
             return []
@@ -692,7 +699,7 @@ class RemoteTarget:
                 proc = subprocess.Popen(
                     self.spec.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                    bufsize=1,
+                    bufsize=1, **hidden_subprocess_kwargs()
                 )
                 self._proc = proc
             except OSError as e:

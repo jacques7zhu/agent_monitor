@@ -115,10 +115,11 @@ quit. Windows may put a newly installed icon under the notification area's `^`
 overflow button until it is pinned.
 
 Maintainers can produce both files from the repository's **Build Windows
-executable** GitHub Actions workflow. A manual workflow run uploads them as the
-`agentmon-windows` artifact; pushing a `v*` tag also attaches them to the
-GitHub release. The build recipe is `agentmon_tray.spec`, and the installer
-recipe is `installer/agentmon.iss`.
+executable** GitHub Actions workflow. A manual workflow run asks for a release
+tag (default `v0.2.0`), uploads the `agentmon-windows` artifact, creates or
+updates that GitHub Release, and attaches both EXEs. Pushing a `v*` tag does the
+same automatically. The build recipe is `agentmon_tray.spec`, and the
+installer recipe is `installer/agentmon.iss`.
 
 The generated files are not code-signed. Windows SmartScreen may therefore
 show an unrecognized-publisher warning until releases are signed with a trusted

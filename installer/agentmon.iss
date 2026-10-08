@@ -1,5 +1,7 @@
 #define MyAppName "agentmon"
+#ifndef MyAppVersion
 #define MyAppVersion "0.2.0"
+#endif
 #define MyAppPublisher "agentmon"
 #define MyAppExeName "agentmon-tray.exe"
 

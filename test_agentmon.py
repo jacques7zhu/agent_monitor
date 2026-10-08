@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -146,6 +147,13 @@ class MonitorSessionSwapTest(unittest.TestCase):
 
 
 class TargetTest(unittest.TestCase):
+    def test_background_helpers_are_hidden_on_windows(self):
+        kwargs = am.hidden_subprocess_kwargs()
+        if os.name == "nt":
+            self.assertEqual(kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+        else:
+            self.assertEqual(kwargs, {})
+
     def test_parse_and_commands(self):
         self.assertEqual(am.parse_target("local").label, "local")
         wsl = am.parse_target("wsl:Ubuntu-24.04")
