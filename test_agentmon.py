@@ -232,6 +232,11 @@ class WindowsTrayLogicTest(unittest.TestCase):
         rows = [self.session(am.IDLE, "idle"), self.session(am.PROCESSING, "busy")]
         self.assertEqual(wintray.overall_state(rows), am.PROCESSING)
         self.assertEqual(wintray.tray_tooltip(rows), "agentmon · 1 busy · 1 idle")
+        rows.append(self.session(am.WAITING_GUESS, "guess"))
+        self.assertEqual(wintray.overall_state(rows), am.WAITING_GUESS)
+        self.assertEqual(
+            wintray.tray_tooltip(rows),
+            "agentmon · 1 waiting? · 1 busy · 1 idle")
         rows.append(self.session(am.WAITING, "wait"))
         self.assertEqual(wintray.overall_state(rows), am.WAITING)
 
@@ -243,6 +248,38 @@ class WindowsTrayLogicTest(unittest.TestCase):
         self.assertTrue(attention.blinking())
         events = attention.update([self.session(am.IDLE)], 3)
         self.assertEqual([event for event, _ in events], ["finished"])
+
+    def test_first_waiting_snapshot_and_guessed_wait_both_alert(self):
+        attention = wintray.Attention()
+        events = attention.update([self.session(am.WAITING)], 1)
+        self.assertEqual([event for event, _ in events], ["waiting"])
+        self.assertTrue(attention.blinking())
+
+        attention = wintray.Attention()
+        attention.update([self.session(am.PROCESSING)], 1)
+        events = attention.update([self.session(am.WAITING_GUESS)], 2)
+        self.assertEqual([event for event, _ in events], ["waiting"])
+        self.assertTrue(attention.blinking())
+
+    def test_exit_after_processing_alerts_and_manual_test_expires(self):
+        attention = wintray.Attention()
+        attention.update([self.session(am.PROCESSING)], 1)
+        events = attention.update([self.session(am.EXITED)], 2)
+        self.assertEqual([event for event, _ in events], ["finished"])
+        self.assertTrue(attention.blinking(3))
+
+        attention.dismiss()
+        attention.flash(10, 8)
+        self.assertTrue(attention.blinking(11))
+        self.assertFalse(attention.blinking(19))
+
+    def test_dismiss_silences_current_wait(self):
+        attention = wintray.Attention()
+        attention.update([self.session(am.PROCESSING)], 1)
+        attention.update([self.session(am.WAITING_GUESS)], 2)
+        attention.dismiss()
+        attention.update([self.session(am.WAITING_GUESS)], 3)
+        self.assertFalse(attention.blinking(3))
 
     def test_generated_icon_is_valid_ico_container(self):
         data = wintray._ico_bytes((255, 0, 0))

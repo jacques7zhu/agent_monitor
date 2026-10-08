@@ -24,9 +24,12 @@ import agentmon as am  # noqa: E402
 REFRESH_MS = 1000
 BLINK_MS = 500
 FLASH_FINISHED = 20
+FLASH_TEST = 8
+WAITING_STATES = (am.WAITING, am.WAITING_GUESS)
 
 COLORS = {
     am.WAITING: (229, 72, 77),
+    am.WAITING_GUESS: (238, 130, 48),
     am.PROCESSING: (245, 165, 36),
     am.IDLE: (48, 164, 108),
     None: (139, 141, 152),
@@ -37,18 +40,23 @@ def overall_state(sessions):
     live = [s.status for s in sessions if s.status != am.EXITED]
     if am.WAITING in live:
         return am.WAITING
-    if am.PROCESSING in live or am.WAITING_GUESS in live:
+    if am.WAITING_GUESS in live:
+        return am.WAITING_GUESS
+    if am.PROCESSING in live:
         return am.PROCESSING
     return am.IDLE if live else None
 
 
 def tray_tooltip(sessions):
     waiting = sum(s.status == am.WAITING for s in sessions)
-    busy = sum(s.status in (am.PROCESSING, am.WAITING_GUESS) for s in sessions)
+    waiting_guess = sum(s.status == am.WAITING_GUESS for s in sessions)
+    busy = sum(s.status == am.PROCESSING for s in sessions)
     idle = sum(s.status == am.IDLE for s in sessions)
     parts = []
     if waiting:
         parts.append("%d waiting" % waiting)
+    if waiting_guess:
+        parts.append("%d waiting?" % waiting_guess)
     if busy:
         parts.append("%d busy" % busy)
     if idle:
@@ -62,6 +70,7 @@ class Attention:
     def __init__(self):
         self.prev = {}
         self.until = {}
+        self.manual_until = 0
 
     def update(self, sessions, now):
         events = []
@@ -71,16 +80,29 @@ class Attention:
             live_keys.add(key)
             old = self.prev.get(key)
             self.prev[key] = s.status
-            if old is None or old == s.status:
+            if old is None:
+                # Remote collectors connect asynchronously. If the first WSL/SSH
+                # snapshot is already waiting, it is a real attention state,
+                # not tray initialization noise.
+                if s.status in WAITING_STATES:
+                    self.until[key] = float("inf")
+                    events.append(("waiting", s))
                 continue
-            if s.status == am.WAITING:
+            if old == s.status:
+                continue
+            if s.status in WAITING_STATES:
+                if old in WAITING_STATES:
+                    continue
                 self.until[key] = float("inf")
                 events.append(("waiting", s))
             elif s.status == am.IDLE and old in (am.PROCESSING, am.WAITING,
                                                   am.WAITING_GUESS):
                 self.until[key] = now + FLASH_FINISHED
                 events.append(("finished", s))
-            elif old == am.WAITING:
+            elif s.status == am.EXITED and old != am.IDLE:
+                self.until[key] = now + FLASH_FINISHED
+                events.append(("finished", s))
+            else:
                 self.until.pop(key, None)
         for key in list(self.until):
             if key not in live_keys or self.until[key] < now:
@@ -88,13 +110,20 @@ class Attention:
         for key in list(self.prev):
             if key not in live_keys:
                 del self.prev[key]
+        if self.manual_until < now:
+            self.manual_until = 0
         return events
 
-    def blinking(self):
-        return bool(self.until)
+    def blinking(self, now=None):
+        now = time.time() if now is None else now
+        return bool(self.until) or self.manual_until > now
+
+    def flash(self, now, seconds):
+        self.manual_until = max(self.manual_until, now + seconds)
 
     def dismiss(self):
         self.until.clear()
+        self.manual_until = 0
 
 
 def _ico_bytes(rgb, outline=False, size=32):
@@ -129,6 +158,7 @@ def write_icons():
     os.makedirs(icon_dir, exist_ok=True)
     paths = {}
     for name, color in (("wait", COLORS[am.WAITING]),
+                        ("guess", COLORS[am.WAITING_GUESS]),
                         ("busy", COLORS[am.PROCESSING]),
                         ("idle", COLORS[am.IDLE]),
                         ("none", COLORS[None])):
@@ -273,6 +303,7 @@ class WindowsTray:
     CMD_DETAILS = 10
     CMD_DISMISS = 11
     CMD_QUIT = 12
+    CMD_TEST = 13
     CMD_SESSION_BASE = 1000
 
     def __init__(self, targets=None):
@@ -294,8 +325,8 @@ class WindowsTray:
         self._ensure_single_instance()
         self._create_window()
         self._load_icons()
-        self._refresh()
         self._add_icon()
+        self._refresh()
         user32.SetTimer(self.hwnd, self.TIMER_REFRESH, REFRESH_MS, None)
         user32.SetTimer(self.hwnd, self.TIMER_BLINK, BLINK_MS, None)
         msg = MSG()
@@ -355,21 +386,43 @@ class WindowsTray:
         if self.attention.blinking() and self.blink_on:
             return "blink"
         return {am.WAITING: "wait", am.PROCESSING: "busy",
-                am.IDLE: "idle", None: "none"}[self.state]
+                am.WAITING_GUESS: "guess", am.IDLE: "idle",
+                None: "none"}[self.state]
 
     def _add_icon(self):
-        nid = self._nid(0x1 | 0x2 | 0x4)  # NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid = self._nid(0x1 | 0x2 | 0x4 | 0x80)  # MESSAGE | ICON | TIP | SHOWTIP
         nid.hIcon = self.icons[self._icon_name()]
         nid.szTip = tray_tooltip(self.sessions)[:127]
         self.added = bool(shell32.Shell_NotifyIconW(0, ctypes.byref(nid)))  # NIM_ADD
+        if self.added:
+            # Microsoft requires setting the desired behavior version after
+            # every NIM_ADD; Explorer forgets it when the taskbar is recreated.
+            version = self._nid()
+            version.uTimeoutOrVersion = 4  # NOTIFYICON_VERSION_4
+            shell32.Shell_NotifyIconW(4, ctypes.byref(version))  # NIM_SETVERSION
+
+    def _modify_icon(self, nid):
+        if self.added and shell32.Shell_NotifyIconW(1, ctypes.byref(nid)):
+            return True
+        # Explorer can recreate its notification area without the registered
+        # TaskbarCreated message reaching us. Remove any stale registration,
+        # re-add once, and retry.
+        stale = self._nid()
+        shell32.Shell_NotifyIconW(2, ctypes.byref(stale))  # NIM_DELETE
+        self.added = False
+        self._add_icon()
+        return bool(self.added and shell32.Shell_NotifyIconW(
+            1, ctypes.byref(nid)))
 
     def _update_icon(self):
         if not self.added:
-            return
-        nid = self._nid(0x2 | 0x4)  # NIF_ICON | NIF_TIP
+            self._add_icon()
+            if not self.added:
+                return
+        nid = self._nid(0x2 | 0x4 | 0x80)  # NIF_ICON | NIF_TIP | NIF_SHOWTIP
         nid.hIcon = self.icons[self._icon_name()]
         nid.szTip = tray_tooltip(self.sessions)[:127]
-        shell32.Shell_NotifyIconW(1, ctypes.byref(nid))  # NIM_MODIFY
+        self._modify_icon(nid)
 
     def _refresh(self):
         now = time.time()
@@ -388,10 +441,11 @@ class WindowsTray:
         self._update_icon()
 
     def _notify(self, kind, session):
-        if not self.added:
-            return
         if kind == "waiting":
-            title = "%s needs approval" % session.agent.capitalize()
+            if session.status == am.WAITING_GUESS:
+                title = "%s may need attention" % session.agent.capitalize()
+            else:
+                title = "%s needs approval" % session.agent.capitalize()
             body = "%s · %s\n%s" % (
                 session.target, session.name, am.short(session.cwd, 160))
             info_flag = 2  # NIIF_WARNING
@@ -400,11 +454,18 @@ class WindowsTray:
             body = "%s\n%s" % (
                 session.target, am.short(session.last_message or session.cwd, 180))
             info_flag = 1  # NIIF_INFO
+        self._show_balloon(title, body, info_flag)
+
+    def _show_balloon(self, title, body, info_flag):
+        if not self.added:
+            self._add_icon()
+        if not self.added:
+            return False
         nid = self._nid(0x10)  # NIF_INFO
         nid.szInfoTitle = title[:63]
         nid.szInfo = body[:255]
         nid.dwInfoFlags = info_flag
-        shell32.Shell_NotifyIconW(1, ctypes.byref(nid))
+        return self._modify_icon(nid)
 
     def _window_proc(self, hwnd, message, wparam, lparam):
         if message == self.taskbar_created:
@@ -413,7 +474,7 @@ class WindowsTray:
             return 0
         if message == self.WM_TRAY:
             mouse_message = int(lparam) & 0xFFFF
-            if mouse_message == 0x0202:  # WM_LBUTTONUP
+            if mouse_message in (0x0202, 0x0400):  # WM_LBUTTONUP / NIN_SELECT
                 self._show_details()
             elif mouse_message in (0x0205, 0x007B):  # WM_RBUTTONUP / CONTEXTMENU
                 self._show_menu()
@@ -442,13 +503,7 @@ class WindowsTray:
             self._balloon_error("Refresh failed", text)
 
     def _balloon_error(self, title, text):
-        if not self.added:
-            return
-        nid = self._nid(0x10)
-        nid.szInfoTitle = title[:63]
-        nid.szInfo = text[:255]
-        nid.dwInfoFlags = 3  # NIIF_ERROR
-        shell32.Shell_NotifyIconW(1, ctypes.byref(nid))
+        self._show_balloon(title, text, 3)  # NIIF_ERROR
 
     def _show_menu(self):
         menu = user32.CreatePopupMenu()
@@ -471,6 +526,7 @@ class WindowsTray:
         user32.AppendMenuW(menu, 0x0800, 0, None)
         user32.AppendMenuW(menu, 0, self.CMD_DETAILS, "Show details…")
         user32.AppendMenuW(menu, 0, self.CMD_DISMISS, "Stop blinking")
+        user32.AppendMenuW(menu, 0, self.CMD_TEST, "Test notification and blinking")
         user32.AppendMenuW(menu, 0, self.CMD_QUIT, "Quit agentmon")
         point = POINT()
         user32.GetCursorPos(ctypes.byref(point))
@@ -489,6 +545,13 @@ class WindowsTray:
             self.attention.dismiss()
             self.blink_on = False
             self._update_icon()
+        elif command == self.CMD_TEST:
+            self.attention.flash(time.time(), FLASH_TEST)
+            self.blink_on = True
+            self._update_icon()
+            self._show_balloon(
+                "agentmon notification test",
+                "Notifications and tray-icon blinking are working.", 1)
         elif command == self.CMD_QUIT:
             user32.DestroyWindow(self.hwnd)
         elif command in self.session_commands:

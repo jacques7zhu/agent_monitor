@@ -72,10 +72,12 @@ inside WSL get the same full process/file correlation as Linux.
 
 `agentmon_tray_windows.py` is a native, dependency-free Windows system-tray
 application. It shows a red icon when approval is required, amber while an
-agent is working, green when all agents are idle, and grey when none are live.
-The icon blinks for attention and sends Windows notifications when approval is
-required or a turn finishes. Left-click for a summary; right-click for a menu
-with every session, details, stop-blinking, and quit actions.
+agent is working, orange when approval is inferred but not confirmed, green
+when all agents are idle, and grey when none are live. The icon blinks for
+attention and sends Windows notifications when approval may be required, a turn
+finishes, or a running session exits. Left-click for a summary; right-click for
+a menu with every session, details, stop-blinking, a **Test notification and
+blinking** action, and quit.
 
 Launch it without a terminal window using `pyw.exe`:
 
@@ -113,6 +115,10 @@ On a fresh install with no targets config, the tray application monitors the
 default WSL distribution. Right-click the tray icon to inspect sessions or
 quit. Windows may put a newly installed icon under the notification area's `^`
 overflow button until it is pinned.
+
+If the test action blinks but does not display a notification, enable
+notifications for agentmon in **Windows Settings → System → Notifications**
+and check that **Do not disturb** is not suppressing them.
 
 Maintainers can produce all platform files from the repository's **Build
 release packages** GitHub Actions workflow. A manual workflow run asks for a
