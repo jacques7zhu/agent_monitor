@@ -1,229 +1,123 @@
 # agentmon
 
-A terminal dashboard for live **Claude Code** and **Codex** sessions. It can
-combine agents running locally, in one or more **WSL** distributions, and on
-**SSH** servers in the same view. For each session it shows its source target,
-status (processing / waiting for approval / idle / exited), time in that state,
-and token usage. For Codex it also shows the rate-limit windows.
+agentmon 在 Windows 通知区域、Ubuntu 顶栏或 macOS 菜单栏中显示
+**Claude Code** 和 **Codex** 的运行状态，并可同时监控：
 
-The core monitor and native Windows tray companion use only the standard
-library (Python 3.8+). On Windows, the interactive TUI optionally uses
-`windows-curses`; the `watch` dashboard and tray icon need no extra package.
+- 本机 Agent
+- Windows 上的 WSL Agent
+- SSH 远程服务器上的 Agent
 
-![agentmon in the terminal](docs/terminal.png)
+它会显示处理中、等待确认、空闲和已退出等状态，并在需要确认或任务完成时闪烁图标；Windows 和 Ubuntu 还会发送系统通知。
+
+## 下载
+
+从 [GitHub Releases](https://github.com/jacques7zhu/agent_monitor/releases/latest)
+下载适合当前系统的安装包。本机不需要手动配置 Python；Ubuntu 安装包所需的
+系统依赖会由软件包管理器自动安装。
+
+| 系统 | 推荐下载 | 其他版本 |
+|---|---|---|
+| Windows x64 | `agentmon-setup.exe` | `agentmon-tray.exe` 便携版 |
+| Ubuntu x86_64 | `agentmon_VERSION_amd64.deb` | `agentmon-linux-x86_64` 终端版 |
+| macOS Apple Silicon | `agentmon-macos-arm64.dmg` | `agentmon-macos-arm64` 终端版 |
+| macOS Intel | `agentmon-macos-x86_64.dmg` | `agentmon-macos-x86_64` 终端版 |
+
+## 安装
+
+### Windows
+
+1. 下载并运行 `agentmon-setup.exe`。
+2. 安装时可选择“登录时启动”。
+3. 启动后，agentmon 图标会出现在右下角通知区域；如果没有看到，请检查 `^` 折叠菜单。
+
+没有配置文件时，Windows 版本默认监控 WSL 的默认发行版。便携版
+`agentmon-tray.exe` 可直接双击运行。
+
+Windows SmartScreen 可能提示“未知发布者”，这是因为当前安装包尚未使用商业证书签名。
+
+### Ubuntu
+
+下载 `.deb` 后安装：
 
 ```sh
-python3 agentmon.py              # interactive TUI
-python3 agentmon.py once         # print the table once
-python3 agentmon.py watch        # portable live view; Ctrl-C to quit
-python3 agentmon.py install-hooks    # recommended: exact "waiting for approval" detection
-python3 agentmon.py uninstall-hooks
+sudo apt install ./agentmon_VERSION_amd64.deb
 ```
 
-Keys: `↑/↓` or `j/k` select · `Enter` details (last prompt and reply) · `s` cycle sort · `a` show or hide exited sessions · `b` bell on approval requests · `q` quit.
+安装完成后，从应用列表打开 **agentmon**。如需登录时自动启动，可在 Ubuntu
+“启动应用程序”中添加命令 `agentmon-tray`。
 
-## Windows, WSL, and SSH targets
+### macOS
 
-Pass `--target` more than once to aggregate sources. It can go before the
-subcommand or after `once`, `watch`, and `tui`:
+1. Apple Silicon 下载 `agentmon-macos-arm64.dmg`，Intel Mac 下载
+   `agentmon-macos-x86_64.dmg`。
+2. 打开 DMG，将 `agentmon.app` 拖入 **Applications**。
+3. 启动后可在菜单栏中打开 **Start at Login**。
 
-```powershell
-# Windows Terminal / PowerShell: native Windows + default WSL distribution
-py agentmon.py watch --target local --target wsl
+当前应用经过临时签名但尚未公证。首次启动若被 macOS 拦截，请按住 Control
+点击应用，选择 **打开** 并确认。
 
-# A named WSL distribution and two servers from ~/.ssh/config
-py agentmon.py once --target wsl:Ubuntu-24.04 --target ssh:build --target ssh:user@example.com
+## 配置监控目标
 
-# Optional: enable the full keyboard-controlled TUI on Windows
-py -m pip install windows-curses
-py agentmon.py --target wsl:Ubuntu-24.04 --target ssh:build
-```
+Windows 默认监控 WSL；Ubuntu 和 macOS 默认监控本机。需要同时监控多个目标时，
+创建以下配置文件：
 
-`wsl:DISTRO` uses `wsl.exe -d DISTRO`. `ssh:HOST` uses the system OpenSSH
-client in non-interactive (`BatchMode`) mode, so set up key authentication and
-put ports, identity files, jump hosts, and other options in `~/.ssh/config`.
-Python 3 must be available as `python3` inside WSL and on SSH hosts.
+- Windows：`%APPDATA%\agentmon\targets.json`
+- Ubuntu / macOS：`~/.config/agentmon/targets.json`
 
-For a persistent setup, create `%APPDATA%\agentmon\targets.json` on Windows or
-`~/.config/agentmon/targets.json` on Linux and macOS:
+示例：
 
 ```json
 {
-  "targets": ["local", "wsl:Ubuntu-24.04", "ssh:build"]
+  "targets": [
+    "local",
+    "wsl:Ubuntu-24.04",
+    "ssh:build"
+  ]
 }
 ```
 
-`AGENTMON_TARGETS=local,wsl:Ubuntu-24.04,ssh:build` is also supported. Explicit
-CLI targets take precedence over the environment variable and config file.
+支持的目标：
 
-There is no server to install or expose. agentmon opens one persistent
-`wsl.exe`/`ssh` process per target, sends the current collector source over
-stdin, and receives versioned JSON snapshots. Connections are isolated and
-automatically retried; an unavailable host is reported without stopping the
-other targets. The `TARGET` column keeps identical session IDs on different
-machines separate.
+- `local`：当前操作系统
+- `wsl`：默认 WSL 发行版，仅 Windows
+- `wsl:Ubuntu-24.04`：指定 WSL 发行版
+- `ssh:build`：`~/.ssh/config` 中名为 `build` 的远程服务器
+- `ssh:user@example.com`：直接指定 SSH 用户和主机
 
-Native Windows monitoring supports Claude's session files directly. Native
-Codex monitoring uses `codex.exe` plus recently active rollout files because
-Windows does not expose Linux-style `/proc/<pid>/fd` links. Agents running
-inside WSL get the same full process/file correlation as Linux.
+修改配置后请退出并重新启动 agentmon。
 
-## Windows notification-area icon
+SSH 目标需要提前配置密钥登录，远程服务器需要提供 `python3`。agentmon
+通过系统自带的 SSH 客户端连接，不需要在远程服务器安装服务或开放额外端口。
+某个远程目标不可用时，不会影响其他目标。
 
-`agentmon_tray_windows.py` is a native, dependency-free Windows system-tray
-application. It shows a red icon when approval is required, amber while an
-agent is working, orange when approval is inferred but not confirmed, green
-when all agents are idle, and grey when none are live. The icon blinks for
-attention and sends Windows notifications when approval may be required, a turn
-finishes, or a running session exits. Left-click for a summary; right-click for
-a menu with every session, details, stop-blinking, a **Test notification and
-blinking** action, and quit.
+## 状态说明
 
-Launch it without a terminal window using `pyw.exe`:
+| 图标 | 状态 | 含义 |
+|---|---|---|
+| 🔴 红色 | waiting | Agent 正在等待确认或授权 |
+| 🟠/🟡 橙色或黄色 | waiting? | 根据活动推测可能正在等待 |
+| 🟡 黄色 | processing | Agent 正在处理任务 |
+| 🟢 绿色 | idle | Agent 已完成并处于空闲状态 |
+| ⚪ 灰色 | no agents | 没有运行中的 Agent |
 
-```powershell
-pyw agentmon_tray_windows.py --target wsl:Ubuntu-24.04
-```
+单击或右键图标可以查看会话、工作目录、模型、Token 用量以及最近的提示和回复。
+需要确认、任务完成或运行中的会话退出时，图标会闪烁；Windows 和 Ubuntu
+还会发送系统通知。
 
-Install it for the current Windows user so it starts automatically at sign-in:
+Windows 版右键菜单提供 **Test notification and blinking**。如果测试时图标会闪烁
+但没有系统通知，请检查：
 
-```powershell
-py agentmon_tray_windows.py install-startup --target wsl:Ubuntu-24.04
-```
+- **设置 → 系统 → 通知** 中是否允许 agentmon 通知
+- Windows **请勿打扰** 是否已开启
+- 图标是否仍位于右下角的 `^` 折叠菜单中
 
-The startup command is stored under the current user's standard Windows `Run`
-registry key and uses `pythonw.exe`, so no console window is opened. To remove
-it from startup (without stopping an already-running icon):
-
-```powershell
-py agentmon_tray_windows.py uninstall-startup
-```
-
-When `%APPDATA%\agentmon\targets.json` already contains the desired targets,
-omit `--target` from all three commands.
-
-### Windows without Python
-
-The Windows release contains two self-contained files; neither requires a
-Python installation:
-
-- `agentmon-tray.exe` — portable version; double-click to run.
-- `agentmon-setup.exe` — per-user installer with Start Menu and optional
-  sign-in startup entries.
-
-On a fresh install with no targets config, the tray application monitors the
-default WSL distribution. Right-click the tray icon to inspect sessions or
-quit. Windows may put a newly installed icon under the notification area's `^`
-overflow button until it is pinned.
-
-If the test action blinks but does not display a notification, enable
-notifications for agentmon in **Windows Settings → System → Notifications**
-and check that **Do not disturb** is not suppressing them.
-
-Maintainers can produce all platform files from the repository's **Build
-release packages** GitHub Actions workflow. A manual workflow run asks for a
-release tag (default `v0.3.0`), creates or updates that GitHub Release, and
-attaches every Windows, Ubuntu, and macOS file. Pushing a `v*` tag does the
-same automatically.
-
-The generated files are not code-signed. Windows SmartScreen may therefore
-show an unrecognized-publisher warning until releases are signed with a trusted
-code-signing certificate.
-
-## Ubuntu top-bar indicator
-
-`agentmon_tray.py` puts a dot in the top-right panel with a short label such as `1 waiting 2 busy`. The dot is red when an agent is waiting for approval, amber when one is working, green when all are idle, and grey when no sessions are running. It blinks while a session waits for approval, and for 20 seconds after a session finishes a turn. A desktop notification has **Show details** and **Go to pane** buttons. Click the indicator for a menu with one entry per session; clicking an entry opens a details window with the table, the last prompt and reply, and a *Go to tmux pane* button.
-
-```sh
-sudo apt install gir1.2-appindicator3-0.1    # one-time; Ubuntu ships the GNOME AppIndicator extension
-python3 agentmon_tray.py install-desktop     # adds "agentmon" to the app menu and starts it on login
-python3 agentmon_tray.py                     # run it now (a second launch opens the details window)
-python3 agentmon_tray.py uninstall-desktop
-```
-
-Ubuntu releases also include:
-
-- `agentmon_VERSION_amd64.deb` — installs the terminal command, top-bar
-  indicator, desktop launcher, and declares the required Ubuntu packages.
-- `agentmon-linux-x86_64` — self-contained portable terminal executable that
-  does not require Python.
-
-Install and launch the package with:
-
-```sh
-sudo apt install ./agentmon_0.3.0_amd64.deb
-agentmon-tray
-```
-
-Or run the portable terminal monitor:
-
-```sh
-chmod +x agentmon-linux-x86_64
-./agentmon-linux-x86_64 once
-```
+## 界面
 
 <p>
-  <img src="docs/topbar.png" alt="agentmon in the Ubuntu top bar" height="56"><br>
-  <img src="docs/menu.png" alt="agentmon indicator menu" width="480">
+  <img src="docs/topbar.png" alt="agentmon Ubuntu 顶栏图标" height="56"><br>
+  <img src="docs/menu.png" alt="agentmon 会话菜单" width="480">
 </p>
 
-![agentmon details window](docs/details.png)
+![agentmon 详情窗口](docs/details.png)
 
-Use the TUI's `install-hooks` as well, so "waiting for approval" is detected exactly rather than guessed. The tray reads the same targets config and lists remote sessions too; jumping to a tmux pane is intentionally enabled only for local sessions.
-
-## macOS menu-bar application
-
-Choose `agentmon-macos-arm64.dmg` for Apple Silicon Macs or
-`agentmon-macos-x86_64.dmg` for Intel Macs. Open the disk image and drag
-`agentmon.app` to Applications. The menu-bar item uses the same red, amber,
-green, and grey states as the other tray applications. Its menu lists live
-sessions, shows details, stops attention blinking, and can enable **Start at
-Login**.
-
-The release also contains matching standalone terminal executables named
-`agentmon-macos-arm64` and `agentmon-macos-x86_64`. They do not require
-Python:
-
-```sh
-chmod +x agentmon-macos-arm64
-./agentmon-macos-arm64 once
-```
-
-The macOS files are ad-hoc signed, not notarized. On first launch, macOS may
-require Control-clicking `agentmon.app`, choosing **Open**, and confirming.
-Configure SSH targets in `~/.config/agentmon/targets.json`; WSL targets are
-Windows-only.
-
-## Release files
-
-| Platform | Installable app/package | Portable executable |
-|---|---|---|
-| Windows x64 | `agentmon-setup.exe` | `agentmon-tray.exe` |
-| Ubuntu x86_64 | `agentmon_VERSION_amd64.deb` | `agentmon-linux-x86_64` |
-| macOS Apple Silicon | `agentmon-macos-arm64.dmg` | `agentmon-macos-arm64` |
-| macOS Intel | `agentmon-macos-x86_64.dmg` | `agentmon-macos-x86_64` |
-
-## Where the data comes from
-
-| | Live sessions | Status | Usage |
-|---|---|---|---|
-| Claude Code | `~/.claude/sessions/<pid>.json` (pid must be alive) | `status` busy/idle in the same file | `message.usage` in `~/.claude/projects/*/<session>.jsonl`, deduplicated per request |
-| Codex | threads a running `codex` process holds in `~/.codex/thread-writer-locks/` (guardian sub-agents hidden), mapped to `~/.codex/sessions/**/rollout-*.jsonl` | `task_started` / `task_complete` | latest `token_count` event, including `rate_limits` |
-
-Session files alone can't show whether an agent is waiting for approval. Without hooks, agentmon shows `waiting?` when a tool call has no result and the transcript hasn't changed for 5 seconds. A long-running command looks the same, so this is only a guess.
-
-`install-hooks` adds `agentmon.py hook --agent …` entries to `~/.claude/settings.json` and `~/.codex/hooks.json`. Existing hooks are kept, the original files are backed up to `*.agentmon.bak`, and running it again is safe. Each hook appends one line to `~/.local/state/agentmon/events.jsonl`. `PermissionRequest`, or a `Notification` of type `permission_prompt`, turns the row red as **waiting**. Already-running sessions pick up the hooks only after a restart.
-
-Hooks are local to each target. Run `install-hooks` from a stable copy of
-`agentmon.py` inside every WSL distribution or SSH host where you want exact
-approval detection. Remote monitoring still works without this step, but a
-pending tool call is shown as `waiting?` after five seconds because it cannot
-be distinguished from a long-running command.
-
-*The screenshots use made-up demo sessions.*
-
-## Tests
-
-```sh
-python3 -m unittest test_agentmon.py
-```
+![agentmon 终端界面](docs/terminal.png)
