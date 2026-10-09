@@ -159,6 +159,7 @@ class TargetTest(unittest.TestCase):
 
     def test_macos_pid_and_codex_process_detection(self):
         with mock.patch.object(am.sys, "platform", "darwin"), \
+                mock.patch.object(am.os, "name", "posix"), \
                 mock.patch.object(am.os, "kill") as kill:
             self.assertTrue(am.pid_alive(123))
             kill.assert_called_once_with(123, 0)
@@ -323,14 +324,15 @@ class MacTrayLogicTest(unittest.TestCase):
     def test_start_at_login_uses_frozen_application(self):
         with tempfile.TemporaryDirectory() as tmp:
             launch_agent = os.path.join(tmp, "dev.agentmon.tray.plist")
-            executable = "/Applications/agentmon.app/Contents/MacOS/agentmon"
+            executable = os.path.join(
+                tmp, "Applications", "agentmon.app", "Contents", "MacOS", "agentmon")
             with mock.patch.object(mactray, "LAUNCH_AGENT", launch_agent), \
                     mock.patch.object(mactray.sys, "frozen", True, create=True), \
                     mock.patch.object(mactray.sys, "executable", executable):
                 mactray.set_start_at_login(True)
                 with open(launch_agent, "rb") as f:
                     data = plistlib.load(f)
-                self.assertEqual(data["ProgramArguments"], [executable])
+                self.assertEqual(data["ProgramArguments"], [os.path.abspath(executable)])
                 self.assertTrue(data["RunAtLoad"])
                 mactray.set_start_at_login(False)
                 self.assertFalse(os.path.exists(launch_agent))
