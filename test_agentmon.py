@@ -226,8 +226,9 @@ class TargetTest(unittest.TestCase):
 
 
 class WindowsTrayLogicTest(unittest.TestCase):
-    def session(self, status, sid="s"):
-        return am.Session(agent="codex", id=sid, target="wsl/Ubuntu", status=status)
+    def session(self, status, sid="s", pid=None):
+        return am.Session(
+            agent="codex", id=sid, pid=pid, target="wsl/Ubuntu", status=status)
 
     def test_overall_state_and_tooltip(self):
         rows = [self.session(am.IDLE, "idle"), self.session(am.PROCESSING, "busy")]
@@ -281,6 +282,34 @@ class WindowsTrayLogicTest(unittest.TestCase):
         attention.dismiss()
         attention.update([self.session(am.WAITING_GUESS)], 3)
         self.assertFalse(attention.blinking(3))
+
+    def test_guessed_wait_notifies_once_per_work_episode(self):
+        attention = wintray.Attention()
+        processing = self.session(am.PROCESSING, pid=42)
+        guessed = self.session(am.WAITING_GUESS, pid=42)
+        attention.update([processing], 1)
+        self.assertEqual(
+            [event for event, _ in attention.update([guessed], 2)], ["waiting"])
+        self.assertEqual(attention.update([guessed], 2.5), [])
+
+        # Codex may append bookkeeping records while a tool is still pending,
+        # making the heuristic briefly oscillate without a user-visible change.
+        attention.update([processing], 3)
+        self.assertEqual(attention.update([guessed], 4), [])
+
+        # Replacing a placeholder id with the real thread id is the same work
+        # episode when the process id is unchanged.
+        replacement = self.session(am.WAITING_GUESS, sid="real", pid=42)
+        self.assertEqual(attention.update([replacement], 5), [])
+
+        # Returning to idle ends the episode; a later turn may alert again.
+        idle = self.session(am.IDLE, sid="real", pid=42)
+        attention.update([idle], 6)
+        processing = self.session(am.PROCESSING, sid="real", pid=42)
+        guessed = self.session(am.WAITING_GUESS, sid="real", pid=42)
+        attention.update([processing], 7)
+        self.assertEqual(
+            [event for event, _ in attention.update([guessed], 8)], ["waiting"])
 
     def test_generated_icon_is_valid_ico_container(self):
         data = wintray._ico_bytes((255, 0, 0))

@@ -70,14 +70,28 @@ class Attention:
     def __init__(self):
         self.prev = {}
         self.until = {}
+        # WAITING_GUESS is inferred from a quiet transcript and can briefly
+        # oscillate back to PROCESSING when Codex appends bookkeeping events.
+        # Remember the current work episode so that oscillation, reconnects,
+        # and placeholder-to-real session id swaps do not repeat notifications.
+        self.seen_waiting_episodes = set()
         self.manual_until = 0
+
+    @staticmethod
+    def episode_key(session):
+        if session.pid:
+            return (session.target, session.agent, "pid", str(session.pid))
+        return (session.target, session.agent, "id", session.id)
 
     def update(self, sessions, now):
         events = []
         live_keys = set()
+        episode_statuses = {}
         for s in sessions:
             key = (s.target, s.agent, s.id)
+            episode = self.episode_key(s)
             live_keys.add(key)
+            episode_statuses.setdefault(episode, set()).add(s.status)
             old = self.prev.get(key)
             self.prev[key] = s.status
             if old is None:
@@ -86,7 +100,9 @@ class Attention:
                 # not tray initialization noise.
                 if s.status in WAITING_STATES:
                     self.until[key] = float("inf")
-                    events.append(("waiting", s))
+                    if episode not in self.seen_waiting_episodes:
+                        events.append(("waiting", s))
+                    self.seen_waiting_episodes.add(episode)
                 continue
             if old == s.status:
                 continue
@@ -94,7 +110,10 @@ class Attention:
                 if old in WAITING_STATES:
                     continue
                 self.until[key] = float("inf")
-                events.append(("waiting", s))
+                if (s.status != am.WAITING_GUESS
+                        or episode not in self.seen_waiting_episodes):
+                    events.append(("waiting", s))
+                self.seen_waiting_episodes.add(episode)
             elif s.status == am.IDLE and old in (am.PROCESSING, am.WAITING,
                                                   am.WAITING_GUESS):
                 self.until[key] = now + FLASH_FINISHED
@@ -110,6 +129,11 @@ class Attention:
         for key in list(self.prev):
             if key not in live_keys:
                 del self.prev[key]
+        live_episodes = set(episode_statuses)
+        self.seen_waiting_episodes.intersection_update(live_episodes)
+        for episode, statuses in episode_statuses.items():
+            if statuses == {am.IDLE}:
+                self.seen_waiting_episodes.discard(episode)
         if self.manual_until < now:
             self.manual_until = 0
         return events
