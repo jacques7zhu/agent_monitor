@@ -1,70 +1,75 @@
 # agentmon
 
-agentmon 在 Windows 通知区域、Ubuntu 顶栏或 macOS 菜单栏中显示
-**Claude Code** 和 **Codex** 的运行状态，并可同时监控：
+agentmon shows the status of **Claude Code** and **Codex** sessions in the
+Windows notification area, Ubuntu top bar, or macOS menu bar. It can monitor:
 
-- 本机 Agent
-- Windows 上的 WSL Agent
-- SSH 远程服务器上的 Agent
+- Agents running locally
+- Agents running in WSL on Windows
+- Agents running on remote servers over SSH
 
-它会显示处理中、等待确认、空闲和已退出等状态，并在需要确认或任务完成时闪烁图标；Windows 和 Ubuntu 还会发送系统通知。
+It tracks processing, approval, idle, and exited states. The icon blinks when
+attention is needed or a task finishes. Windows and Ubuntu also display system
+notifications.
 
-## 下载
+## Download
 
-从 [GitHub Releases](https://github.com/jacques7zhu/agent_monitor/releases/latest)
-下载适合当前系统的安装包。本机不需要手动配置 Python；Ubuntu 安装包所需的
-系统依赖会由软件包管理器自动安装。
+Download the package for your system from
+[GitHub Releases](https://github.com/jacques7zhu/agent_monitor/releases/latest).
+You do not need to configure Python locally. The Ubuntu package installs its
+system dependencies through the package manager.
 
-| 系统 | 推荐下载 | 其他版本 |
+| Platform | Recommended download | Alternative |
 |---|---|---|
-| Windows x64 | `agentmon-setup.exe` | `agentmon-tray.exe` 便携版 |
-| Ubuntu x86_64 | `agentmon_VERSION_amd64.deb` | `agentmon-linux-x86_64` 终端版 |
-| macOS Apple Silicon | `agentmon-macos-arm64.dmg` | `agentmon-macos-arm64` 终端版 |
-| macOS Intel | `agentmon-macos-x86_64.dmg` | `agentmon-macos-x86_64` 终端版 |
+| Windows x64 | `agentmon-setup.exe` | `agentmon-tray.exe` portable app |
+| Ubuntu x86_64 | `agentmon_VERSION_amd64.deb` | `agentmon-linux-x86_64` terminal app |
+| macOS Apple Silicon | `agentmon-macos-arm64.dmg` | `agentmon-macos-arm64` terminal app |
+| macOS Intel | `agentmon-macos-x86_64.dmg` | `agentmon-macos-x86_64` terminal app |
 
-## 安装
+## Install
 
 ### Windows
 
-1. 下载并运行 `agentmon-setup.exe`。
-2. 安装时可选择“登录时启动”。
-3. 启动后，agentmon 图标会出现在右下角通知区域；如果没有看到，请检查 `^` 折叠菜单。
+1. Download and run `agentmon-setup.exe`.
+2. Choose the optional start-at-sign-in task during installation.
+3. Start agentmon and look for its icon in the notification area. Windows may
+   initially place it under the `^` overflow menu.
 
-没有配置文件时，Windows 版本默认监控 WSL 的默认发行版。便携版
-`agentmon-tray.exe` 可直接双击运行。
+Without a targets configuration, the Windows app monitors the default WSL
+distribution. You can also run the portable `agentmon-tray.exe` directly.
 
-Windows SmartScreen 可能提示“未知发布者”，这是因为当前安装包尚未使用商业证书签名。
+Windows SmartScreen may show an unknown-publisher warning because the current
+release is not signed with a commercial certificate.
 
 ### Ubuntu
 
-下载 `.deb` 后安装：
+Download the `.deb` file and install it:
 
 ```sh
 sudo apt install ./agentmon_VERSION_amd64.deb
 ```
 
-安装完成后，从应用列表打开 **agentmon**。如需登录时自动启动，可在 Ubuntu
-“启动应用程序”中添加命令 `agentmon-tray`。
+Open **agentmon** from the application menu after installation. To launch it
+automatically at login, add `agentmon-tray` to Ubuntu's Startup Applications.
 
 ### macOS
 
-1. Apple Silicon 下载 `agentmon-macos-arm64.dmg`，Intel Mac 下载
-   `agentmon-macos-x86_64.dmg`。
-2. 打开 DMG，将 `agentmon.app` 拖入 **Applications**。
-3. 启动后可在菜单栏中打开 **Start at Login**。
+1. Download `agentmon-macos-arm64.dmg` for Apple Silicon or
+   `agentmon-macos-x86_64.dmg` for an Intel Mac.
+2. Open the DMG and drag `agentmon.app` into **Applications**.
+3. Start agentmon and enable **Start at Login** from its menu if desired.
 
-当前应用经过临时签名但尚未公证。首次启动若被 macOS 拦截，请按住 Control
-点击应用，选择 **打开** 并确认。
+The app is ad-hoc signed but not notarized. If macOS blocks the first launch,
+Control-click `agentmon.app`, choose **Open**, and confirm.
 
-## 配置监控目标
+## Configure monitoring targets
 
-Windows 默认监控 WSL；Ubuntu 和 macOS 默认监控本机。需要同时监控多个目标时，
-创建以下配置文件：
+Windows monitors the default WSL distribution by default. Ubuntu and macOS
+monitor the local system. To monitor multiple targets, create:
 
-- Windows：`%APPDATA%\agentmon\targets.json`
-- Ubuntu / macOS：`~/.config/agentmon/targets.json`
+- Windows: `%APPDATA%\agentmon\targets.json`
+- Ubuntu and macOS: `~/.config/agentmon/targets.json`
 
-示例：
+Example:
 
 ```json
 {
@@ -76,48 +81,51 @@ Windows 默认监控 WSL；Ubuntu 和 macOS 默认监控本机。需要同时监
 }
 ```
 
-支持的目标：
+Supported target values:
 
-- `local`：当前操作系统
-- `wsl`：默认 WSL 发行版，仅 Windows
-- `wsl:Ubuntu-24.04`：指定 WSL 发行版
-- `ssh:build`：`~/.ssh/config` 中名为 `build` 的远程服务器
-- `ssh:user@example.com`：直接指定 SSH 用户和主机
+- `local` — the current operating system
+- `wsl` — the default WSL distribution on Windows
+- `wsl:Ubuntu-24.04` — a named WSL distribution
+- `ssh:build` — the `build` host from `~/.ssh/config`
+- `ssh:user@example.com` — a directly specified SSH user and host
 
-修改配置后请退出并重新启动 agentmon。
+Quit and restart agentmon after changing the configuration.
 
-SSH 目标需要提前配置密钥登录，远程服务器需要提供 `python3`。agentmon
-通过系统自带的 SSH 客户端连接，不需要在远程服务器安装服务或开放额外端口。
-某个远程目标不可用时，不会影响其他目标。
+SSH targets require key-based authentication and `python3` on the remote
+server. agentmon uses the system SSH client; it does not require a remote
+service or additional open ports. An unavailable target does not interrupt
+monitoring of other targets.
 
-## 状态说明
+## Status
 
-| 图标 | 状态 | 含义 |
+| Icon | Status | Meaning |
 |---|---|---|
-| 🔴 红色 | waiting | Agent 正在等待确认或授权 |
-| 🟠/🟡 橙色或黄色 | waiting? | 根据活动推测可能正在等待 |
-| 🟡 黄色 | processing | Agent 正在处理任务 |
-| 🟢 绿色 | idle | Agent 已完成并处于空闲状态 |
-| ⚪ 灰色 | no agents | 没有运行中的 Agent |
+| 🔴 Red | `waiting` | The agent is waiting for approval |
+| 🟠/🟡 Orange or yellow | `waiting?` | The agent may be waiting, based on recent activity |
+| 🟡 Yellow | `processing` | The agent is processing a task |
+| 🟢 Green | `idle` | The agent has finished and is idle |
+| ⚪ Grey | no agents | No agents are currently running |
 
-单击或右键图标可以查看会话、工作目录、模型、Token 用量以及最近的提示和回复。
-需要确认、任务完成或运行中的会话退出时，图标会闪烁；Windows 和 Ubuntu
-还会发送系统通知。
+Click the icon to inspect sessions, working directories, models, token usage,
+and recent prompts and replies. The icon blinks when approval is needed, a task
+finishes, or a running session exits. Windows and Ubuntu also display system
+notifications.
 
-Windows 版右键菜单提供 **Test notification and blinking**。如果测试时图标会闪烁
-但没有系统通知，请检查：
+The Windows menu includes **Test notification and blinking**. If the icon
+blinks during the test but no notification appears, check:
 
-- **设置 → 系统 → 通知** 中是否允许 agentmon 通知
-- Windows **请勿打扰** 是否已开启
-- 图标是否仍位于右下角的 `^` 折叠菜单中
+- Whether agentmon notifications are enabled under **Settings → System →
+  Notifications**
+- Whether Windows **Do not disturb** is enabled
+- Whether the icon is hidden under the notification area's `^` overflow menu
 
-## 界面
+## Screenshots
 
 <p>
-  <img src="docs/topbar.png" alt="agentmon Ubuntu 顶栏图标" height="56"><br>
-  <img src="docs/menu.png" alt="agentmon 会话菜单" width="480">
+  <img src="docs/topbar.png" alt="agentmon in the Ubuntu top bar" height="56"><br>
+  <img src="docs/menu.png" alt="agentmon session menu" width="480">
 </p>
 
-![agentmon 详情窗口](docs/details.png)
+![agentmon details window](docs/details.png)
 
-![agentmon 终端界面](docs/terminal.png)
+![agentmon terminal view](docs/terminal.png)
